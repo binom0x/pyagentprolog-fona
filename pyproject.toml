@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyagentprolog-fona"
+version = "0.1.0"
+description = "Decorator-based framework for background AI agents on PyAgentProlog"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Andrey Vorfolomeev", email = "binom0x@proton.me" }]
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "httpx>=0.27",
+    "pydantic>=2.6",
+    "transformers>=4.40",
+    "huggingface_hub>=0.23",
+    "pyagentprolog>=1.0.1",
+    "pyagentprolog-hf>=1.0.2",
+]
+
+[project.optional-dependencies]
+torch = ["torch>=2.0"]
+semantic = ["sentence-transformers>=3.0"]
+all = ["torch>=2.0", "sentence-transformers>=3.0"]
+
+[tool.setuptools.packages.find]
+include = ["fona*"]
