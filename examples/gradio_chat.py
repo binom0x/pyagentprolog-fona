@@ -14,8 +14,7 @@ from prolog.proagent_gradio import (
 # -------------------------------------------------------------------
 chat_agent = Agent()
 
-@chat_agent.program
-PROGRAM = """
+chat_agent.program("""
 run :- greeting, loop.
 
 greeting :-
@@ -30,7 +29,7 @@ handle(Text) :-
     echo(Text, Reply),
     ui_print(Reply),
     loop.
-"""
+""")
 
 @chat_agent.action
 def echo(text):

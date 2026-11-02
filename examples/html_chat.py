@@ -1,10 +1,10 @@
 """Чат-бот на Fona + vanilla HTML/JS + SSE."""
 import asyncio
 import json
+import os
 import threading
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any, Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
@@ -14,8 +14,8 @@ from pydantic import BaseModel
 from fona import Agent
 from fona.agent import _clone_model
 from prolog.proagent_gradio import (
-    AgentGradioSession, get_session, register_session,
-    remove_session, send_input_to_agent,
+    AgentGradioSession,
+    register_session, get_session, remove_session,
 )
 
 
@@ -24,8 +24,7 @@ from prolog.proagent_gradio import (
 # -------------------------------------------------------------------
 chat_agent = Agent()
 
-@chat_agent.program
-PROGRAM = """
+chat_agent.program("""
 run :- greeting, loop.
 
 greeting :-
@@ -40,7 +39,7 @@ handle(Text) :-
     echo(Text, Reply),
     ui_print(Reply),
     loop.
-"""
+""")
 
 @chat_agent.action
 def echo(text):
@@ -48,25 +47,25 @@ def echo(text):
 
 
 _MODEL = chat_agent.build(with_ui=True)
-_SESSIONS: dict[str, AgentGradioSession] = {}
-_LOCK = threading.Lock()
 
 
+# -------------------------------------------------------------------
+# Сессии — через реестр proagent_gradio, чтобы send_input_to_agent работал
+# -------------------------------------------------------------------
 def _new_session() -> str:
     sid = str(uuid.uuid4())
     sess = AgentGradioSession()
-    with _LOCK:
-        _SESSIONS[sid] = sess
+    register_session(sid, sess)              # ← в реестр
     clone = _clone_model(_MODEL)
     sess.start(clone.agent, query="run.")
     return sid
 
 
 def _drop(sid: str):
-    with _LOCK:
-        sess = _SESSIONS.pop(sid, None)
+    sess = get_session(sid)
     if sess:
         sess.stop()
+        remove_session(sid)
 
 
 # -------------------------------------------------------------------
@@ -79,11 +78,12 @@ class _Input(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    try:
-        from prolog.arith_numba import warmup_arith_numba
-        warmup_arith_numba()
-    except Exception:
-        pass
+    if os.getenv('FONA_WARMUP') == '1':
+        try:
+            from prolog.arith_numba import warmup_arith_numba
+            warmup_arith_numba()
+        except Exception:
+            pass
     yield
 
 
@@ -102,13 +102,12 @@ async def chat_start():
 
 @app.post("/api/chat/input")
 async def chat_input(req: _Input):
-    with _LOCK:
-        sess = _SESSIONS.get(req.session_id)
+    sess = get_session(req.session_id)
     if not sess:
         raise HTTPException(404, "session not found")
     if not sess.running:
         raise HTTPException(409, "session ended")
-    send_input_to_agent(req.session_id, req.text)
+    sess.send_input(req.text)                # ← прямой вызов, реестр уже найден
     return {"status": "ok"}
 
 
@@ -120,15 +119,13 @@ async def chat_stop(session_id: str):
 
 @app.get("/api/chat/stream")
 async def chat_stream(session_id: str):
-    with _LOCK:
-        if session_id not in _SESSIONS:
-            raise HTTPException(404, "session not found")
+    if not get_session(session_id):
+        raise HTTPException(404, "session not found")
 
     async def gen():
         yield 'event: state\ndata: {"running": true}\n\n'
         while True:
-            with _LOCK:
-                sess = _SESSIONS.get(session_id)
+            sess = get_session(session_id)
             if sess is None:
                 yield 'event: state\ndata: {"running": false, "removed": true}\n\n'
                 return
@@ -159,9 +156,7 @@ async def chat_stream(session_id: str):
     )
 
 
-# -------------------------------------------------------------------
-# HTML
-# -------------------------------------------------------------------
+# HTML-шаблон — без изменений, полный текст ниже
 CHAT_HTML = r"""<!DOCTYPE html>
 <html lang="ru">
 <head>

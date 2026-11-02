@@ -1,91 +1,91 @@
 # pyagentprolog-fona
 
-Минималистичный фреймворк для фоновых ИИ-агентов на PyAgentProlog.
-Пользователь пишет **Prolog** и **Python-функции**, а всё остальное —
-FastAPI, SSE-UI, REST для других агентов, фоновый запуск на Windows —
-прячется за декораторами.
+A minimalist framework for background AI agents on PyAgentProlog.
+The user writes **Prolog** and **Python functions**, and everything else —
+FastAPI, SSE UI, REST for other agents, background launch on Windows —
+is hidden behind decorators.
 
 ```python
 from fona import agent
 
 agent.program("""
 run :-
-    ui_print('Введите имя:'),
+    ui_print('Enter your name:'),
     ui_read(Name),
-    format('Привет, ~w!', [Name], Msg),
+    format('Hello, ~w!', [Name], Msg),
     ui_print(Msg).
 """)
 
 agent.run()
 ```
 
-После запуска:
+After launch:
 
-- `http://127.0.0.1:8000/` — готовый UI с логом, вводом и кнопками.
-- `http://127.0.0.1:8000/docs` — интерактивная OpenAPI-документация.
-- `http://127.0.0.1:8000/api/v1/query` — REST для других агентов.
+- `http://127.0.0.1:8000/` — a ready UI with log, input and buttons.
+- `http://127.0.0.1:8000/docs` — interactive OpenAPI documentation.
+- `http://127.0.0.1:8000/api/v1/query` — REST endpoint for other agents.
 
-Запуск занимает ~2 секунды для standalone-агента: `transformers`
-и `torch` **не** импортируются, пока не запрошена HF-модель.
+Startup takes ~2 seconds for a standalone agent: `transformers` and
+`torch` are **not** imported until an HF model is requested.
 
 ---
 
-## Содержание
+## Table of Contents
 
-- [Установка](#установка)
-- [Быстрый старт](#быстрый-старт)
-- [Декораторы](#декораторы)
-  - [`@agent.program` — три формы](#agentprogram--три-формы)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Decorators](#decorators)
+  - [`@agent.program` — three forms](#agentprogram--three-forms)
   - [`@agent.action`](#agentaction)
   - [`@agent.effect`](#agenteffect)
   - [`@agent.generate`](#agentgenerate)
-- [Запуск](#запуск)
-- [HF-модели](#hf-модели)
-- [Программный доступ](#программный-доступ)
+- [Running the Agent](#running-the-agent)
+- [HF Models](#hf-models)
+- [Programmatic Access](#programmatic-access)
 - [REST API](#rest-api)
-- [HITL и UI](#hitl-и-ui)
-- [Мультиагентное взаимодействие](#мультиагентное-взаимодействие)
-- [Фоновый режим](#фоновый-режим)
-- [Служба Windows (NSSM)](#служба-windows-nssm)
-- [Переменные окружения](#переменные-окружения)
-- [Архитектура](#архитектура)
-- [Производительность](#производительность)
-- [Ограничения и подводные камни](#ограничения-и-подводные-камни)
-- [Лицензия](#лицензия)
+- [HITL and UI](#hitl-and-ui)
+- [Multi-Agent Interaction](#multi-agent-interaction)
+- [Background Mode](#background-mode)
+- [Windows Service (NSSM)](#windows-service-nssm)
+- [Environment Variables](#environment-variables)
+- [Architecture](#architecture)
+- [Performance](#performance)
+- [Limitations and Pitfalls](#limitations-and-pitfalls)
+- [License](#license)
 
 ---
 
-## Установка
+## Installation
 
-Базовый вариант (standalone-агенты, без torch):
+Base install (standalone agents, no torch):
 
 ```bash
 pip install pyagentprolog-fona
 ```
 
-С поддержкой HF Hub, torch и эмбеддингов:
+With HF Hub, torch and embeddings:
 
 ```bash
 pip install "pyagentprolog-fona[all]"
 ```
 
-Только HF Hub (без sentence-transformers):
+HF Hub only (no sentence-transformers):
 
 ```bash
 pip install "pyagentprolog-fona[torch]"
 ```
 
-Только семантика (без torch-моделей HF):
+Semantics only (no HF torch models):
 
 ```bash
 pip install "pyagentprolog-fona[semantic]"
 ```
 
-Требования: Python 3.10+, PyAgentProlog ≥ 5.9.1, PyAgentProlog-HF ≥ 0.2.0.
+Requirements: Python 3.10+, PyAgentProlog ≥ 5.9.1, PyAgentProlog-HF ≥ 0.2.0.
 
 ---
 
-## Быстрый старт
+## Quick Start
 
 `hello.py`:
 
@@ -96,9 +96,9 @@ agent.program("""
 run :- loop.
 
 loop :-
-    ui_print('Введите сообщение (или "stop"):'),
+    ui_print('Type a message (or "stop"):'),
     ui_read(Action),
-    ( Action = "stop" -> ui_print('Пока!'), !
+    ( Action = "stop" -> ui_print('Bye!'), !
     ; ui_print(Action),
       loop
     ).
@@ -113,45 +113,45 @@ if __name__ == '__main__':
 python hello.py
 ```
 
-Терминал покажет:
+The terminal will show:
 
 ```
 [fona] build(): 0.00s (standalone)
 INFO:     Uvicorn running on http://127.0.0.1:8000
 ```
 
-Откройте `http://127.0.0.1:8000/` и **нажмите «Запустить»**. Предикат
-`run.` выполняется по клику, а не при старте uvicorn: иначе каждая
-открытая вкладка держала бы поток, заблокированный на `ui_read`.
+Open `http://127.0.0.1:8000/` and **click “Start”**. The `run.` predicate
+is executed on click, not at uvicorn startup: otherwise every open tab
+would hold a thread blocked on `ui_read`.
 
-Встроенные предикаты, доступные в любом агенте с UI:
+Built-in predicates available in any agent with UI:
 
-| Предикат | Описание |
+| Predicate | Description |
 |---|---|
-| `ui_print(+Text)` | Вывести текст в лог UI |
-| `ui_read(-Text)` | Дождаться ввода из UI |
-| `ui_get_value(+Name, -Value)` | Прочитать значение UI-компонента |
-| `gradio_print/1`, `gradio_read_input/1`, `gradio_get_ui_value/2` | Алиасы для совместимости |
-| `format(+Fmt, +Args, -Text)` | Форматирование строки |
+| `ui_print(+Text)` | Print text to the UI log |
+| `ui_read(-Text)` | Wait for UI input |
+| `ui_get_value(+Name, -Value)` | Read the value of a UI component |
+| `gradio_print/1`, `gradio_read_input/1`, `gradio_get_ui_value/2` | Compatibility aliases |
+| `format(+Fmt, +Args, -Text)` | String formatting |
 
 ---
 
-## Декораторы
+## Decorators
 
-### `@agent.program` — три формы
+### `@agent.program` — three forms
 
-**Важно:** в Python декоратор нельзя применить к присваиванию.
-Запись
+**Important:** in Python a decorator cannot be applied to an assignment.
+The line
 
 ```python
 @agent.program
 PROGRAM = """..."""      # ← SyntaxError
 ```
 
-**невалидна**, интерпретатор падает ещё до вызова декоратора. Fona
-поддерживает три корректные формы:
+**is invalid**; the interpreter fails before the decorator is even called.
+Fona supports three correct forms:
 
-#### Форма 1 — прямой вызов
+#### Form 1 — direct call
 
 ```python
 from fona import agent
@@ -162,14 +162,14 @@ parent(alexey, peter).
 
 run :-
     parent(ivan, X),
-    format('Ребёнок Ивана: ~w', [X], Msg),
+    format('Ivan''s child: ~w', [X], Msg),
     ui_print(Msg).
 """)
 ```
 
-Самая простая, работает всегда.
+The simplest form; always works.
 
-#### Форма 2 — декоратор на функции
+#### Form 2 — decorator on a function
 
 ```python
 from fona import agent
@@ -183,11 +183,11 @@ def _program():
     """
 ```
 
-Работает, потому что `@agent.program` вызывает функцию и берёт строку.
-Имя функции сохраняется — можно распечатать исходник через
-`print(_program())`.
+This works because `@agent.program` calls the function and takes the
+returned string. The function name is preserved — you can print the
+source with `print(_program())`.
 
-#### Форма 3 — присваивание
+#### Form 3 — assignment
 
 ```python
 from fona import agent
@@ -198,44 +198,44 @@ run :- parent(ivan, X), ui_print(X).
 """
 ```
 
-Работает через дескриптор `_ProgramDescriptor`. Визуально похоже на
-исходную (невалидную) запись, но без `@`.
+This works through the `_ProgramDescriptor`. Visually similar to the
+original (invalid) form, but without `@`.
 
-#### Семантика накопления
+#### Accumulation semantics
 
-Несколько вызовов `agent.program(...)` **накапливают** текст:
+Multiple `agent.program(...)` calls **accumulate** text:
 
 ```python
 agent.program("fact1(1).")
 agent.program("fact2(2).")
-# В базе: fact1/1 и fact2/1
+# The database now contains fact1/1 and fact2/1
 ```
 
-С HF-моделью текст **дополняет** `config.program` модели (prepend —
-ваши правила идут первыми; см. [HF-модели](#hf-модели)).
+With an HF model, the text **supplements** the model's `config.program`
+(prepended — your rules come first; see [HF Models](#hf-models)).
 
 ### `@agent.action`
 
-Предикат, **возвращающий значение**. Арность и позиция выходного
-аргумента выводятся из сигнатуры.
+A predicate that **returns a value**. Arity and output-argument
+position are inferred from the signature.
 
 ```python
 @agent.action
 def ask_llm(prompt):
     return llm_client.generate(prompt)
-# → предикат ask_llm/2, output_arg=1
+# → predicate ask_llm/2, output_arg=1
 
 @agent.action(name='ask_llm', arity=2, output_arg=1)
 def ask(prompt):
     return llm_client.generate(prompt)
 ```
 
-Правила вывода:
+Inference rules:
 
-- Имя предиката = имя Python-функции (или `name=`).
-- Арность = число параметров + 1 (для output).
-- Выходной аргумент — последний.
-- `context` не считается параметром, но доступен:
+- Predicate name = Python function name (or `name=`).
+- Arity = number of parameters + 1 (for the output).
+- Output argument is the last one.
+- `context` is not counted as a parameter, but is available:
 
 ```python
 @agent.action
@@ -243,26 +243,26 @@ def ask(prompt, context):
     return context['llm'].generate(prompt)
 ```
 
-- Если функция содержит `yield`, автоматически оборачивается как
-  генератор — каждый `yield` даёт отдельное решение.
-- Возврат `None` → **провал** (backtracking).
+- If the function contains `yield`, it is automatically wrapped as a
+  generator — each `yield` produces a separate solution.
+- Returning `None` → **failure** (backtracking).
 
 ### `@agent.effect`
 
-Побочный эффект без возврата. Все аргументы входные. **Всегда
-успешно**, если не было исключения.
+A side effect without a return value. All arguments are inputs.
+**Always succeeds** unless an exception was raised.
 
 ```python
 @agent.effect
 def log_to_file(text):
     with open('agent.log', 'a') as f:
         f.write(text + '\n')
-# → предикат log_to_file/1
+# → predicate log_to_file/1
 ```
 
 ### `@agent.generate`
 
-Явное объявление генератора.
+Explicit declaration of a generator.
 
 ```python
 @agent.generate
@@ -270,10 +270,10 @@ def rooms():
     yield "kitchen"
     yield "bedroom"
     yield "living_room"
-# → предикат rooms/1
+# → predicate rooms/1
 ```
 
-В Prolog:
+In Prolog:
 
 ```prolog
 all_rooms :-
@@ -283,60 +283,61 @@ all_rooms :-
 all_rooms.
 ```
 
-### Таблица соответствия
+### Comparison table
 
-| Декоратор | Возврат | При неудаче | Пример |
+| Decorator | Returns | On failure | Typical use |
 |---|---|---|---|
-| `@agent.action` | значение → в output_arg | `None` → fail | LLM-запрос, вычисление, сенсор |
-| `@agent.effect` | нет | исключение → fail | запись в лог, отправка команды |
-| `@agent.generate` | `yield` → решения | пустой генератор → fail | перебор комнат, вариантов |
+| `@agent.action` | value → into output_arg | `None` → fail | LLM call, computation, sensor |
+| `@agent.effect` | nothing | exception → fail | log write, command dispatch |
+| `@agent.generate` | `yield` → solutions | empty generator → fail | enumerating rooms, options |
 
 ---
 
-## Запуск
+## Running the Agent
 
 ```python
 agent.run()                       # foreground, 127.0.0.1:8000
-agent.run(port=9000)              # другой порт
-agent.run(host='0.0.0.0')         # по сети (см. token)
-agent.run(ui=False)               # только REST
-agent.run(rest=False)             # только UI
-agent.run(token='secret')         # REST под токеном
-agent.run(background=True)        # скрытый процесс (pythonw)
+agent.run(port=9000)              # different port
+agent.run(host='0.0.0.0')         # over the network (see token)
+agent.run(ui=False)               # REST only
+agent.run(rest=False)             # UI only
+agent.run(token='secret')         # REST behind a token
+agent.run(background=True)        # hidden process (pythonw)
 ```
 
-`agent.run()` — блокирующий вызов. `background=True` возвращает
-управление сразу, запустив дочерний `pythonw.exe`.
+`agent.run()` is a blocking call. `background=True` returns immediately,
+launching a child `pythonw.exe` process.
 
-### Что доступно после запуска
+### Endpoints after launch
 
-| URL | Назначение |
+| URL | Purpose |
 |---|---|
-| `/` | HTML UI с логом и вводом |
+| `/` | HTML UI with log and input |
 | `/docs` | Swagger / OpenAPI |
 | `/api/v1/health` | Health-check |
-| `/api/v1/model` | Информация о загруженной модели |
-| `/api/v1/query` | REST: выполнить Prolog-запрос |
-| `/api/v1/query_one` | REST: первый ответ |
-| `/api/v1/stream` | SSE-стрим решений |
-| `/api/v1/facts` | Добавить факт(ы) |
-| `/api/v1/actions` | Список зарегистрированных действий |
-| `/api/v1/ui/start` · `input` · `stop` · `stream` | HITL-сессии |
+| `/api/v1/model` | Info about the loaded model |
+| `/api/v1/query` | REST: run a Prolog query |
+| `/api/v1/query_one` | REST: first answer only |
+| `/api/v1/stream` | SSE stream of solutions |
+| `/api/v1/facts` | Add fact(s) |
+| `/api/v1/actions` | List of registered actions |
+| `/api/v1/ui/start` · `input` · `stop` · `stream` | HITL sessions |
 
-### Автостарт HITL
+### HITL auto-start
 
-По умолчанию `run.` стартует по клику **Запустить**. Чтобы диалог
-начинался сразу при открытии страницы, добавьте `start();` в конец
-`<script>` в `fona/ui.py` (или своём HTML — см. [HITL и UI](#hitl-и-ui)).
+By default `run.` starts when the **Start** button is clicked. To make
+the dialog start immediately when the page opens, add `start();` at the
+end of the `<script>` in `fona/ui.py` (or your own HTML — see
+[HITL and UI](#hitl-and-ui)).
 
 ---
 
-## HF-модели
+## HF Models
 
-Fona умеет загружать `PyAgentPrologModel` с Hugging Face Hub (или из
-локальной директории) как **базу** для агента.
+Fona can load a `PyAgentPrologModel` from Hugging Face Hub (or a local
+directory) as the agent's **base**.
 
-### Простейший вариант
+### Simplest variant
 
 ```python
 from fona import agent
@@ -345,11 +346,11 @@ agent.load_hub('user/pyagent-prolog-demo')
 agent.run()
 ```
 
-Модель загружается через `PyAgentPrologModel.from_pretrained(...,
-trust_remote_code=True)`. Её `config.program`, `config.kb_file` и
-семантические директивы подхватываются автоматически.
+The model is loaded via `PyAgentPrologModel.from_pretrained(...,
+trust_remote_code=True)`. Its `config.program`, `config.kb_file`, and
+semantic directives are picked up automatically.
 
-### С расширениями
+### With extensions
 
 ```python
 from fona import agent
@@ -362,7 +363,7 @@ def translate(text):
 
 agent.program = """
 run :-
-    ui_print('Текст:'),
+    ui_print('Text:'),
     ui_read(Text),
     translate(Text, En),
     ui_print(En).
@@ -371,11 +372,11 @@ run :-
 agent.run()
 ```
 
-`agent.program` **дополняет** `config.program` HF-модели (prepend), а
-`translate/2` регистрируется в том же `Database` — HF-программа может
-его вызывать.
+`agent.program` **supplements** the HF model's `config.program`
+(prepended), and `translate/2` is registered in the same `Database` —
+the HF program can call it.
 
-### Через `Agent.from_hub`
+### Via `Agent.from_hub`
 
 ```python
 from fona import Agent
@@ -384,28 +385,28 @@ a = Agent.from_hub('user/repo', revision='main')
 a.run()
 ```
 
-### KB из Hub
+### KB from Hub
 
-Если в `config.json` модели есть `kb_file`, но файл не найден
-локально, Fona автоматически вызывает `hf_hub_download` и загружает
-KB в `Database`. Это обходит ограничение обёртки
-`pyagentprolog-hf`: `_resolve_kb_path` не работает для `hf:user/repo`.
+If the model's `config.json` specifies `kb_file` but the file is not
+found locally, Fona automatically calls `hf_hub_download` and loads the
+KB into the `Database`. This bypasses the `pyagentprolog-hf` wrapper
+limitation: `_resolve_kb_path` does not work for `hf:user/repo`.
 
-### Приватные модели
+### Private models
 
 ```bash
 export FONA_HF_TOKEN=hf_xxxxxxxxxxxxxxxx
 python agent.py
 ```
 
-Локально без сети:
+Offline / cached-only:
 
 ```bash
 export FONA_LOCAL_ONLY=1
 python agent.py
 ```
 
-### Overrides после загрузки
+### Overrides after load
 
 ```python
 agent.load_hub('user/repo')
@@ -420,14 +421,14 @@ agent.configure(
 )
 ```
 
-Работает только для HF-модели: применяется **после** загрузки и
+Applies to HF models only: it is executed **after** loading and
 `_ensure_solver()`.
 
 ---
 
-## Программный доступ
+## Programmatic Access
 
-Если сервер не нужен, Fona даёт прямой доступ к модели:
+If a server is not needed, Fona provides direct access to the model:
 
 ```python
 from fona import Agent
@@ -438,7 +439,7 @@ result = a.query('light(kitchen, X).')
 print(result['solution'])       # [{'X': 'on'}]
 
 sol = a.query_one('light(kitchen, X).')
-print(sol)                       # {'X': 'on'} или None
+print(sol)                       # {'X': 'on'} or None
 
 for sol in a.stream('light(Room, State).'):
     print(sol)
@@ -446,19 +447,19 @@ for sol in a.stream('light(Room, State).'):
 result = a('light(kitchen, X).')
 ```
 
-Тот же объект потом можно поднять как сервер: `a.run()`.
+The same object can later be brought up as a server: `a.run()`.
 
-### Терминальный режим без сервера
+### Terminal mode without a server
 
-Если браузер не нужен, объявите свои `print`/`input`-действия и
-вызовите `query` напрямую:
+If a browser is not needed, declare your own `print`/`input` actions
+and call `query` directly:
 
 ```python
 from fona import agent
 
 @agent.effect
 def say(text):
-    print(f'[Агент]: {text}', flush=True)
+    print(f'[Agent]: {text}', flush=True)
 
 @agent.action
 def ask():
@@ -467,24 +468,24 @@ def ask():
 agent.program = """
 run :- loop.
 loop :-
-    say('Введите сообщение (или "stop"):'),
+    say('Type a message (or "stop"):'),
     ask(Action),
-    ( Action = "stop" -> say('Пока!'), !
+    ( Action = "stop" -> say('Bye!'), !
     ; say(Action), loop
     ).
 """
 
 if __name__ == '__main__':
-    agent.build()          # без with_ui=True
-    agent.query('run.')    # без HTTP
+    agent.build()          # without with_ui=True
+    agent.query('run.')    # no HTTP
 ```
 
 ---
 
 ## REST API
 
-Все эндпоинты, кроме `/health`, требуют `X-API-Key`, если при запуске
-был передан `token=` (или задан `FONA_TOKEN`).
+All endpoints except `/health` require `X-API-Key` if `token=` was
+passed at launch (or `FONA_TOKEN` is set).
 
 ```http
 POST /api/v1/query
@@ -494,7 +495,7 @@ X-API-Key: your-token-here
 {"query": "light(kitchen, X)."}
 ```
 
-Ответ:
+Response:
 
 ```json
 {
@@ -505,19 +506,19 @@ X-API-Key: your-token-here
 }
 ```
 
-Провал:
+Failure:
 
 ```json
 {"success": false, "query": "light(garage, X).", "solutions": [], "count": 0}
 ```
 
-Ошибка разбора или выполнения:
+Parse or execution error:
 
 ```json
 {"success": false, "query": "broken(", "error": "Query parse error: ..."}
 ```
 
-Пример:
+Example:
 
 ```python
 import httpx
@@ -531,7 +532,7 @@ r = httpx.post(
 print(r.json())
 ```
 
-### Добавление фактов
+### Adding facts
 
 ```python
 httpx.post(
@@ -541,7 +542,7 @@ httpx.post(
 )
 ```
 
-### SSE-стрим
+### SSE stream
 
 ```bash
 curl -N -X POST http://127.0.0.1:8000/api/v1/stream \
@@ -550,7 +551,7 @@ curl -N -X POST http://127.0.0.1:8000/api/v1/stream \
   -d '{"query": "light(Room, State)."}'
 ```
 
-События:
+Events:
 
 ```
 data: {"Room": "kitchen", "State": "on"}
@@ -563,58 +564,57 @@ data: {}
 
 ---
 
-## HITL и UI
+## HITL and UI
 
-HITL в Fona — естественное продолжение агента. В Prolog вы пишете
-`ui_read/1`, а JS-фронтенд разблокирует поле ввода. Состояние живёт в
-`Database`, а не в чекпоинтах.
+HITL in Fona is a natural extension of the agent. In Prolog you write
+`ui_read/1`, and the JS frontend unlocks the input field. State lives
+in the `Database`, not in checkpoints.
 
-### Как устроена сессия
+### How a session works
 
-Каждый клик **Запустить** → `POST /api/v1/ui/start` → создаётся:
+Every **Start** click → `POST /api/v1/ui/start` → the server creates:
 
-1. **Клон модели** (`_clone_model`) — независимый `Database` и
-   `tracer`. Пользовательские `@agent.action` и стандартные
-   `gradio_*`/`ui_*` копируются.
-2. **`QueryOneSession`** — наследник `AgentGradioSession`, вызывает
-   `query_one('run.')` вместо `query('run.')`. Это важно для
-   HF-моделей: если ваш `PROGRAM` переопределяет `run/0`, HF-ный
-   `run/0` не будет выполняться вдогонку.
-3. **SSE-канал** `/api/v1/ui/stream?session_id=...` — стримит вывод
-   (`event: output`) и состояние (`event: state`).
+1. **A model clone** (`_clone_model`) — independent `Database` and
+   `tracer`. User `@agent.action` and standard `gradio_*`/`ui_*` are
+   copied.
+2. **`QueryOneSession`** — a subclass of `AgentGradioSession` that calls
+   `query_one('run.')` instead of `query('run.')`. This is important
+   for HF models: if your `PROGRAM` overrides `run/0`, the HF-side
+   `run/0` will not run afterwards.
+3. **SSE channel** `/api/v1/ui/stream?session_id=...` — streams output
+   (`event: output`) and state (`event: state`).
 
-### Ввод из UI
+### Input from the UI
 
-JS читает значения компонентов и передаёт их в `POST
-/api/v1/ui/input`. Значения попадают в `session.set_ui_value`,
-доступны из Prolog через `ui_get_value/2` или
-`gradio_get_ui_value/2`.
+JS reads component values and sends them to `POST /api/v1/ui/input`.
+Values land in `session.set_ui_value` and are accessible from Prolog
+via `ui_get_value/2` or `gradio_get_ui_value/2`.
 
 ```prolog
 run :-
     ui_get_value('mode_select', Mode),
-    format('Режим: ~w', [Mode], Msg),
+    format('Mode: ~w', [Mode], Msg),
     ui_print(Msg),
     ui_read(Text),
     ...
 ```
 
-### Автостарт
+### Auto-start
 
-Одна строка в конце `<script>` в `fona/ui.py`:
+One line at the end of `<script>` in `fona/ui.py`:
 
 ```javascript
 start();
 ```
 
-Этого достаточно, чтобы диалог стартовал при открытии страницы. Для
-production добавьте очистку сессий по таймауту.
+That is enough for the dialog to start when the page opens. For
+production, add periodic cleanup of idle sessions.
 
-### Полная замена HTML
+### Full HTML replacement
 
-HTML-шаблон — это строка `HTML` в `fona/ui.py`. Чтобы заменить его на
-свой (например, чат-бот в стиле bubbles), передайте `html=` в
-`create_app` и добавьте параметр в `run()`:
+The HTML template is the `HTML` string in `fona/ui.py`. To replace it
+with your own (e.g. a bubbles-style chat), pass `html=` to
+`create_app` and add the parameter to `run()`:
 
 ```python
 # fona/server.py
@@ -627,10 +627,10 @@ def create_app(model, *, html=None, **kwargs):
 
 ---
 
-## Мультиагентное взаимодействие
+## Multi-Agent Interaction
 
-Агенты общаются по HTTP. Один агент — REST-сервер; другой вызывает
-его как обычное действие.
+Agents communicate over HTTP. One agent is a REST server; another calls
+it as an ordinary action.
 
 `server_agent.py`:
 
@@ -641,7 +641,7 @@ agent.program = """
 light(kitchen, on).
 light(bedroom, off).
 
-run :- ui_print('Сервер фактов готов.').
+run :- ui_print('Fact server ready.').
 """
 
 agent.run(port=8000, ui=False, token='secret')
@@ -669,46 +669,46 @@ run :-
     ask_remote('http://127.0.0.1:8000/api/v1/query',
                'light(kitchen, X).',
                Solutions),
-    format('Получено: ~w', [Solutions], Msg),
+    format('Received: ~w', [Solutions], Msg),
     ui_print(Msg).
 """
 
 agent.run(port=8001)
 ```
 
-### Проверка
+### Verification
 
 ```bash
-# терминал A
+# terminal A
 python server_agent.py
 
-# терминал B — убедиться, что сервер жив
+# terminal B — check that the server is alive
 curl -X POST http://127.0.0.1:8000/api/v1/query \
      -H "Content-Type: application/json" \
      -H "X-API-Key: secret" \
      -d '{"query": "light(kitchen, X)."}'
 
-# терминал C
+# terminal C
 python client_agent.py
-# открыть http://127.0.0.1:8001/, нажать «Запустить»
+# open http://127.0.0.1:8001/ and click "Start"
 ```
 
-В логе клиента должно появиться `Получено: [{'X': 'on'}]`. Если сервер
-не запущен — в stderr клиента будет `httpx.ConnectError`, а в UI —
-«Агент завершил выполнение без решений».
+The client log should show `Received: [{'X': 'on'}]`. If the server is
+down — the client's stderr will show `httpx.ConnectError`, and the UI
+will show “Agent finished without solutions.”
 
-### Общая память
+### Shared memory
 
-Три подхода:
+Three approaches:
 
-1. **Общая KB через файл.** Два агента читают/пишут один `kb.pl`, но
-   `Database` у каждого свой.
-2. **REST `/api/v1/facts`.** Один агент — «владелец» KB, остальные
-   пишут через API.
-3. **`context` с общим клиентом.** Передайте в `agent.build()` объект
-   БД/очереди, доступный всем действиям.
+1. **Shared KB via a file.** Two agents read/write the same `kb.pl`, but
+   each has its own `Database`.
+2. **REST `/api/v1/facts`.** One agent owns the KB; others write
+   through the API.
+3. **`context` with a shared client.** Pass a DB/queue client object
+   into `agent.build()`; all actions see it.
 
-### Маршрутизация через Prolog
+### Routing via Prolog
 
 ```prolog
 route(Task, Agent) :-
@@ -720,43 +720,43 @@ agent_capability('http://agent-a:8000', light).
 agent_capability('http://agent-b:8000', temperature).
 ```
 
-Диспетчер — обычный `Agent` с правилами `route/2` и действием
-`ask_remote/3`. Всё аудируется через ProofTracer при
+The dispatcher is a normal `Agent` with `route/2` rules and an
+`ask_remote/3` action. Everything is auditable via `ProofTracer` when
 `with_explanation=True`.
 
 ---
 
-## Фоновый режим
+## Background Mode
 
 ### `agent.run(background=True)`
 
-Запускает дочерний `pythonw.exe` (Windows) или `python` (Unix) в
-фоне. Родительский процесс возвращает управление сразу.
+Launches a child `pythonw.exe` (Windows) or `python` (Unix) in the
+background. The parent process returns immediately.
 
 ```python
 agent.run(background=True)
-print('Агент работает в фоне')
+print('Agent is running in the background')
 ```
 
-Что происходит под капотом:
+What happens under the hood:
 
-1. `sys.modules['__main__'].__file__` — путь к скрипту.
-2. `sys.executable` заменяется на `pythonw.exe`, если найден.
-3. `Popen` с `FONA_CHILD=1`.
-4. Дочерний процесс видит `FONA_CHILD=1` и не спавнится снова.
+1. `sys.modules['__main__'].__file__` — path to the script.
+2. `sys.executable` is replaced with `pythonw.exe` if found.
+3. `Popen` with `FONA_CHILD=1` in env.
+4. The child sees `FONA_CHILD=1` and does not spawn again.
 
-### Ограничение
+### Limitation
 
-Если скрипт — REPL или `python -c "..."`, `_spawn_background` не
-найдёт `.py`-файл и запустит foreground.
+If the script is a REPL or `python -c "..."`, `_spawn_background` will
+not find a `.py` file and will run in the foreground instead.
 
 ---
 
-## Служба Windows (NSSM)
+## Windows Service (NSSM)
 
-Для production на Windows — служба через [NSSM](https://nssm.cc/).
-Даёт автозапуск при загрузке ОС и перезапуск при сбоях, независимо
-от входа пользователя.
+For production on Windows, use a service via [NSSM](https://nssm.cc/).
+It gives autostart at OS boot and restart on failure, independent of
+user login.
 
 ```cmd
 nssm install FonaAgent "C:\Python311\python.exe" "C:\agents\agent.py"
@@ -772,15 +772,15 @@ nssm set FonaAgent Start SERVICE_AUTO_START
 nssm start FonaAgent
 ```
 
-Важно:
+Important:
 
-- `python.exe`, а не `pythonw.exe` — NSSM перенаправляет
-  stdout/stderr в файлы.
-- `AppDirectory` обязателен, иначе не найдутся модули.
-- `AppRotateBytes` + `AppRotateFiles=1` — ротация логов.
-- `AppEnvironmentExtra` — переменные окружения.
+- `python.exe`, not `pythonw.exe` — NSSM redirects stdout/stderr to
+  files.
+- `AppDirectory` is required; otherwise modules will not be found.
+- `AppRotateBytes` + `AppRotateFiles=1` — log rotation.
+- `AppEnvironmentExtra` — environment variables.
 
-Управление:
+Management:
 
 ```cmd
 nssm stop FonaAgent
@@ -790,152 +790,152 @@ nssm remove FonaAgent confirm
 
 ---
 
-## Переменные окружения
+## Environment Variables
 
 Fona:
 
-| Переменная | Значение | Описание |
+| Variable | Value | Description |
 |---|---|---|
-| `FONA_HF_TOKEN` | `hf_xxx...` | Токен HF Hub для приватных моделей |
-| `FONA_LOCAL_ONLY` | `1` | Не обращаться к сети, использовать кэш HF Hub |
-| `FONA_TOKEN` | `secret` | Токен REST API (по умолчанию — без аутентификации) |
-| `FONA_WARMUP` | `1` | Прогреть Numba JIT при старте (для арифметически-тяжёлых агентов) |
-| `FONA_CHILD` | `1` | Внутренний маркер дочернего процесса при `background=True` |
+| `FONA_HF_TOKEN` | `hf_xxx...` | HF Hub token for private models |
+| `FONA_LOCAL_ONLY` | `1` | Do not use the network; use HF Hub cache only |
+| `FONA_TOKEN` | `secret` | REST API token (no auth by default) |
+| `FONA_WARMUP` | `1` | Warm up Numba JIT at startup (for arithmetic-heavy agents) |
+| `FONA_CHILD` | `1` | Internal marker for the background child process |
 
 PyAgentProlog:
 
-| Переменная | Описание |
+| Variable | Description |
 |---|---|
-| `PROLOG_NUMBA_DISABLE=1` | Отключить Numba-ускорение арифметики |
-| `PROLOG_ST_VERBOSE=1` | Показывать прогресс-бары sentence-transformers |
-| `HF_HUB_DISABLE_PROGRESS_BARS=1` | Отключить полосы загрузки HF Hub |
+| `PROLOG_NUMBA_DISABLE=1` | Disable Numba arithmetic acceleration |
+| `PROLOG_ST_VERBOSE=1` | Show sentence-transformers progress bars |
+| `HF_HUB_DISABLE_PROGRESS_BARS=1` | Disable HF Hub download bars |
 
 ---
 
-## Архитектура
+## Architecture
 
 ```
 Fona Agent
 │
 ├── Agent (fona.agent)
-│   ├── _program      — Prolog-текст
-│   ├── _actions      — Python-предикаты (@action/@effect/@generate)
-│   ├── _hub_source   — (repo, revision), если load_hub()
+│   ├── _program      — Prolog text
+│   ├── _actions      — Python predicates (@action/@effect/@generate)
+│   ├── _hub_source   — (repo, revision), if load_hub()
 │   ├── _overrides    — configure()
 │   └── build() → PyAgentPrologModel | _StandaloneModel
 │
-├── PyAgentPrologModel (pyagentprolog-hf)   ← только для HF-пути
+├── PyAgentPrologModel (pyagentprolog-hf)   ← HF path only
 │   ├── config        — PyAgentPrologConfig
-│   ├── agent         — Agent из PyAgentProlog
+│   ├── agent         — Agent from PyAgentProlog
 │   └── _ensure_solver
 │
-├── _StandaloneModel (fona.agent)           ← HF-путь не нужен
-│   ├── config        — SimpleNamespace (минимум полей)
-│   ├── agent         — Agent из PyAgentProlog
+├── _StandaloneModel (fona.agent)           ← no HF path needed
+│   ├── config        — SimpleNamespace (minimum fields)
+│   ├── agent         — Agent from PyAgentProlog
 │   └── _ensure_solver (no-op)
 │
 └── FastAPI (fona.server)
     ├── /                       — HTML (fona.ui)
-    ├── /api/v1/ui/*            — HITL-сессии (QueryOneSession)
+    ├── /api/v1/ui/*            — HITL sessions (QueryOneSession)
     ├── /api/v1/query           — REST
     ├── /api/v1/query_one       — REST
     ├── /api/v1/stream          — SSE
-    ├── /api/v1/facts           — добавить факты
-    ├── /api/v1/actions         — список действий
-    └── /api/v1/model           — информация о модели
+    ├── /api/v1/facts           — add facts
+    ├── /api/v1/actions         — list of actions
+    └── /api/v1/model           — model info
 ```
 
-### Поток `agent.run()` для standalone
+### `agent.run()` flow for standalone
 
 ```
 agent.run(background=False)
 │
 ├── build(with_ui=True)
 │   ├── _StandaloneModel(_program, overrides)
-│   │   └── prolog.agent.Agent(program)      ← без torch, без transformers
+│   │   └── prolog.agent.Agent(program)      ← no torch, no transformers
 │   ├── register _actions
 │   └── _install_ui_actions → ui_print/1, ui_read/1, gradio_*
 │
 ├── _start_query(model) → "run."
 │
 └── create_app(model, start_query, ...)
-    └── uvicorn.run(app)        ← ~2 c, torch не импортирован
+    └── uvicorn.run(app)        ← ~2 s, torch not imported
 ```
 
-### Поток `agent.run()` для HF
+### `agent.run()` flow for HF
 
 ```
 agent.run(background=False)
 │
 ├── build(with_ui=True)
-│   ├── _import_hf() → from pyagentprolog_hf import ...  ← здесь transformers/torch
+│   ├── _import_hf() → from pyagentprolog_hf import ...  ← transformers/torch here
 │   ├── PyAgentPrologModel.from_pretrained(repo, trust_remote_code=True)
 │   ├── _ensure_solver()
-│   ├── _ensure_kb_loaded (hf_hub_download, если kb_file задан)
+│   ├── _ensure_kb_loaded (hf_hub_download if kb_file is set)
 │   ├── prepend @agent.program rules (at_beginning=True)
 │   ├── register _actions
 │   └── _install_ui_actions
 │
-└── create_app(model, ...) → uvicorn.run(app)   ← ~7 c
+└── create_app(model, ...) → uvicorn.run(app)   ← ~7 s
 ```
 
-### Поток HITL-запроса
+### HITL request flow
 
 ```
-Браузер                   Сервер
-   │                        │
-   ├─ POST /ui/start ──────►│  _clone_model(model)
-   │                        │  _create_query_one_session()
-   │                        │  sess.start(clone.agent, 'run.')
-   │  ◄──── session_id ─────│
-   │                        │
-   ├─ GET /ui/stream ──────►│  StreamingResponse:
-   │  ◄──── event: state ───│    yield 'running'
-   │  ◄──── event: output ──│    session.get_output()
-   │                        │    await asyncio.sleep(0.2)
-   │                        │
-   ├─ POST /ui/input ──────►│  session.set_ui_value(...)
-   │                        │  session.send_input(text)
-   │                        │
-   │                        │  QueryOneSession._run:
-   │                        │    agent.query_one('run.')
-   │                        │    ui_read/1 блокируется на input_queue.get()
-   │                        │
-   │                        │  Prolog продолжается:
-   │                        │    ui_print(Result) → output_queue
-   │                        │    running=False
-   │                        │
-   │  ◄──── event: output ──│  последние сообщения
-   │  ◄──── event: state ───│  finished=true
+Browser                    Server
+   │                          │
+   ├─ POST /ui/start ────────►│  _clone_model(model)
+   │                          │  _create_query_one_session()
+   │                          │  sess.start(clone.agent, 'run.')
+   │  ◄──── session_id ───────│
+   │                          │
+   ├─ GET /ui/stream ────────►│  StreamingResponse:
+   │  ◄──── event: state ─────│    yield 'running'
+   │  ◄──── event: output ────│    session.get_output()
+   │                          │    await asyncio.sleep(0.2)
+   │                          │
+   ├─ POST /ui/input ────────►│  session.set_ui_value(...)
+   │                          │  session.send_input(text)
+   │                          │
+   │                          │  QueryOneSession._run:
+   │                          │    agent.query_one('run.')
+   │                          │    ui_read/1 blocks on input_queue.get()
+   │                          │
+   │                          │  Prolog continues:
+   │                          │    ui_print(Result) → output_queue
+   │                          │    running=False
+   │                          │
+   │  ◄──── event: output ────│  final messages
+   │  ◄──── event: state ─────│  finished=true
 ```
 
 ---
 
-## Производительность
+## Performance
 
-Замеры на Windows 11 / Python 3.12 / CPU:
+Measurements on Windows 11 / Python 3.12 / CPU:
 
-| Этап | Standalone | HF |
+| Stage | Standalone | HF |
 |---|---|---|
-| `from fona import agent` | 0.4 с | 7.4 с |
-| `agent.build()` | 0.2 с | 0.3 с |
-| `create_app` + `uvicorn.run` | 1.5 с | 1.5 с |
-| `warmup_arith_numba` (опционально) | 0 с | 12 с |
-| **Итого при старте** | **~2 с** | **~9 с** |
+| `from fona import agent` | 0.4 s | 7.4 s |
+| `agent.build()` | 0.2 s | 0.3 s |
+| `create_app` + `uvicorn.run` | 1.5 s | 1.5 s |
+| `warmup_arith_numba` (optional) | 0 s | 12 s |
+| **Total startup** | **~2 s** | **~9 s** |
 
-Что помогает:
+What helps:
 
-- **Standalone-путь без torch/transformers.** `_import_hf()` вызывается
-  только при `load_hub()` / `from_hub()`. Обычный `agent.run()` не
-  тянет `transformers`/`torch`.
-- **`FONA_WARMUP=1`** — opt-in для Numba JIT. Чат-ботам без арифметики
-  он не нужен.
-- **`PROLOG_NUMBA_DISABLE=1`** — отключить numba полностью, если JIT
-  не нужен.
+- **Standalone path without torch/transformers.** `_import_hf()` is
+  called only on `load_hub()` / `from_hub()`. Ordinary `agent.run()`
+  does not pull in `transformers`/`torch`.
+- **`FONA_WARMUP=1`** — opt-in for Numba JIT. Chat bots without
+  arithmetic do not need it.
+- **`PROLOG_NUMBA_DISABLE=1`** — disable numba entirely if JIT is not
+  needed.
 - **CPU-only torch** (`pip install torch --index-url
-  https://download.pytorch.org/whl/cpu`) — импортируется быстрее.
+  https://download.pytorch.org/whl/cpu`) — imports faster.
 
-Проверить, что torch не загрузился в standalone:
+Verify that torch is not loaded in standalone:
 
 ```python
 import sys
@@ -944,90 +944,89 @@ assert 'torch' not in sys.modules
 
 ---
 
-## Ограничения и подводные камни
+## Limitations and Pitfalls
 
-### `Database` не потокобезопасна
+### `Database` is not thread-safe
 
-`interpreter.py` мутирует `rules`, `rule_index`, `_cut_counter`,
-`tracer`. Поэтому:
+`interpreter.py` mutates `rules`, `rule_index`, `_cut_counter`,
+`tracer`. Therefore:
 
-- **REST-запросы** к шаблонной модели идут под `threading.RLock` (в
-  `create_app`).
-- **HITL-сессии** изолированы: каждая со своей копией модели.
-- **Программный `agent.query()`** без сервера **не потокобезопасен**.
-  Из нескольких потоков — оборачивайте в свой лок.
+- **REST requests** to the template model run under a
+  `threading.RLock` (inside `create_app`).
+- **HITL sessions** are isolated: each has its own model copy.
+- **Programmatic `agent.query()`** without a server is **not
+  thread-safe**. From multiple threads, wrap it in your own lock.
 
-### `semantic_on` — глобальное состояние
+### `semantic_on` — global state
 
-`_current_unifier` в `prolog.embedding_unify` — один на процесс. Если
-включите семантику через `configure(semantic_enabled=True)`, она
-повлияет на HF-модель и HITL-сессии. Это ожидаемо.
+`_current_unifier` in `prolog.embedding_unify` is per process. If you
+enable semantics via `configure(semantic_enabled=True)`, it affects the
+HF model and every HITL session. This is expected.
 
-### `remote_query` под `API_LOCK`
+### `remote_query` under `API_LOCK`
 
-Если `ask_remote/3` вызывает другой агент, шаблонная модель держит
-лок на всё время HTTP-запроса. Для цепочек: короткий `timeout`
-(5–10 с), лучше вызывать `ask_remote` из клиентского агента снаружи.
+If `ask_remote/3` calls another agent, the template model holds the
+lock for the entire HTTP request. For chains: keep `timeout` short
+(5–10 s); preferably call `ask_remote` from a client agent externally.
 
-### `kb_file` не перезагружается динамически
+### `kb_file` is not reloaded dynamically
 
-`configure(kb_file=...)` не перезагружает KB: обёртка не
-предоставляет публичного API. Workaround:
+`configure(kb_file=...)` does not reload the KB: the wrapper does not
+expose a public API. Workaround:
 
 ```python
 agent.build()._load_kb_file('/path/to/new.pl', 'text')
 ```
 
-Это внутренний API, но работает. Для продакшна лучше перезапустить
-процесс.
+This is an internal API, but it works. For production, restart the
+process instead.
 
-### `PROGRAM` только дополняет HF-модель
+### `PROGRAM` only supplements the HF model
 
-Через `@agent.program` нельзя **удалить** правила из
-`config.program` HF-модели. Ваши правила prepend-ятся, HF-ные
-остаются. Полное переопределение — используйте Fona без
-`load_hub()`.
+You cannot **remove** rules from the HF model's `config.program` via
+`@agent.program`. Your rules are prepended; the HF ones remain. Full
+override — use Fona without `load_hub()`.
 
-### `@agent.program` на присваивании — SyntaxError
+### `@agent.program` on assignment — SyntaxError
 
-Запись `@agent.program\nPROGRAM = ...` **невалидна**. Используйте
-одну из трёх форм: `agent.program(...)`, `@agent.program def ...`,
-`agent.program = ...`. См. [`@agent.program` — три
-формы](#agentprogram--три-формы).
+The form `@agent.program\nPROGRAM = ...` **is invalid**. Use one of
+the three forms: `agent.program(...)`, `@agent.program def ...`,
+`agent.program = ...`. See [`@agent.program` — three
+forms](#agentprogram--three-forms).
 
-### `None` в `@agent.action` → fail
+### `None` in `@agent.action` → fail
 
-Возврат `None` означает провал предиката (backtracking). Если нужен
-«всегда успешный» эффект — `@agent.effect`.
+Returning `None` means predicate failure (backtracking). If you need
+an “always-successful” effect — use `@agent.effect`.
 
-### `output_arg` по умолчанию — последний
+### `output_arg` defaults to the last argument
 
-`@agent.action` делает **последний** аргумент выходным. Если функция
-принимает `(prompt, temp=0.7)`, предикат будет `ask/3` с
-`output_arg=2`, а `temp` станет вторым аргументом. Используйте
-`@agent.action(output_arg=N)` или `arity=`.
+`@agent.action` treats the **last** argument as the output. If the
+function signature is `(prompt, temp=0.7)`, the predicate becomes
+`ask/3` with `output_arg=2`, and `temp` becomes the second argument.
+Use `@agent.action(output_arg=N)` or `arity=`.
 
-### HITL-старт по клику, а не при загрузке uvicorn
+### HITL start by click, not on uvicorn startup
 
-По умолчанию `run.` выполняется после нажатия **Запустить**. Если
-хотите автостарт — добавьте `start();` в `<script>` шаблона (см.
-[HITL и UI](#hitl-и-ui)).
+By default, `run.` is executed after pressing **Start**. For auto-start,
+add `start();` to the template's `<script>` (see
+[HITL and UI](#hitl-and-ui)).
 
-### `from_pretrained` в HITL-клонах
+### `from_pretrained` in HITL clones
 
-`_clone_model` использует `PyAgentPrologConfig.from_pretrained(...,
-local_files_only=True)` для HF-моделей. Если кэш HF Hub пуст (модель
-загружалась без кэширования), клон упадёт. Решение —
-`FONA_LOCAL_ONLY=1` или явный прогрев кэша.
-
----
-
-## Лицензия
-
-MIT. См. `LICENSE`.
+`_clone_model` uses `PyAgentPrologConfig.from_pretrained(...,
+local_files_only=True)` for HF models. If the HF Hub cache is empty
+(the model was loaded without caching), the clone will fail. Fix —
+`FONA_LOCAL_ONLY=1` or warm up the cache explicitly.
 
 ---
 
-## Авторы
+## License
+
+MIT. See `LICENSE`.
+
+---
+
+## Authors
 
 - Andrey Vorfolomeev — PyAgentProlog, PyAgentProlog-HF, Fona
