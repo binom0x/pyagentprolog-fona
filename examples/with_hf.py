@@ -8,19 +8,17 @@ def translate(text):
     """Перевод через ваш LLM-клиент (заглушка)."""
     return f"[en] {text}"
 
-@agent.program
-PROGRAM = """
+agent.program("""
 run :- loop.
 
 loop :-
-    ui_print('Сообщение (или "stop"):'),
-    ui_read(Text),
-    ( Text = "stop" -> ui_print('Пока!'), !
-    ; translate(Text, En),
-      ui_print(En),
+    ui_print('Введите сообщение (или "stop"):'),
+    ui_read(Action),
+    ( Action = "stop" -> ui_print('Пока!'), !
+    ; ui_print(Action),
       loop
     ).
-"""
+""")
 
 if __name__ == '__main__':
     agent.run()

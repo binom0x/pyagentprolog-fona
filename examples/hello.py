@@ -1,7 +1,6 @@
 from fona import agent
 
-@agent.program
-PROGRAM = """
+agent.program("""
 run :- loop.
 
 loop :-
@@ -11,7 +10,7 @@ loop :-
     ; ui_print(Action),
       loop
     ).
-"""
+""")
 
 if __name__ == '__main__':
     agent.run()

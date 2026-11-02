@@ -8,11 +8,65 @@ import sys
 import threading
 from typing import Any, Optional
 
-from pyagentprolog_hf import PyAgentPrologConfig, PyAgentPrologModel
 from prolog.bridge import prolog_to_python, python_to_prolog
 from prolog.parser import Parser
 from prolog.terms import Variable
 
+# =====================================================================
+# Ленивые импорты и standalone-модель (без torch/transformers)
+# =====================================================================
+import time as _time
+from types import SimpleNamespace
+
+
+def _log(msg: str):
+    print(f"[fona] {msg}", file=sys.stderr, flush=True)
+
+
+def _import_hf():
+    """Импортирует pyagentprolog_hf ТОЛЬКО по требованию (HF-путь)."""
+    t0 = _time.time()
+    from pyagentprolog_hf import PyAgentPrologConfig, PyAgentPrologModel
+    _log(f"import pyagentprolog_hf: {_time.time()-t0:.2f}s")
+    return PyAgentPrologConfig, PyAgentPrologModel
+
+
+class _StandaloneModel:
+    """Лёгкий duck-type PyAgentPrologModel без torch/transformers.
+
+    Реализует ровно те атрибуты, которые использует fona.server:
+        .agent, .config, .add_facts(...), .name_or_path, ._model_dir
+    """
+
+    def __init__(self, program: str, config_overrides: dict):
+        from prolog.agent import Agent as CoreAgent
+        self.agent = CoreAgent(program, context={})
+        self.solver = self.agent.solver
+        self.name_or_path = '<inline>'
+        self._model_dir = None
+
+        # Минимальный config для /api/v1/model и _start_query
+        defaults = dict(
+            program=program, kb_file=None, kb_format='auto',
+            semantic_enabled=False, semantic_backend='st',
+            semantic_model='intfloat/multilingual-e5-small',
+            semantic_threshold=0.82, default_main=None,
+            max_solutions=0, with_explanation=False,
+        )
+        defaults.update(config_overrides)
+        self.config = SimpleNamespace(**defaults)
+
+    def _ensure_solver(self):
+        pass
+
+    def add_fact(self, text):
+        self.agent.add_fact(text)
+
+    def add_facts(self, text):
+        self.agent.add_facts(text)
+
+    def __repr__(self):
+        return f"_StandaloneModel(rules={len(self.agent.solver.database.rules)})"
 
 # =====================================================================
 # Обёртки: Python-функция → Prolog-предикат
@@ -110,6 +164,31 @@ def _wrap_generator(func, name, arity, out):
         return results
     return _tag(w, name, arity, func, 'generator')
 
+# =====================================================================
+# Дескриптор, позволяющий три формы определения программы агента: 
+#   agent.program = """..."""          # присваивание
+#   agent.program("""...""")           # вызов
+#   @agent.program                     # декоратор на def
+#   def _(): return "..."
+# =====================================================================
+class _ProgramSetter:
+    """Callable-вид agent.program для формы agent.program('...')."""
+    __slots__ = ('_agent',)
+    def __init__(self, agent):
+        self._agent = agent
+    def __call__(self, source):
+        self._agent._set_program(source)
+        return source     # для @-декоратора: имя функции остаётся функцией
+
+
+class _ProgramDescriptor:
+    """Дескриптор: agent.program = ... ИЛИ agent.program(...) ИЛИ @agent.program."""
+    def __get__(self, obj, objtype=None):
+        if obj is None:
+            return self
+        return _ProgramSetter(obj)
+    def __set__(self, obj, value):
+        obj._set_program(value)
 
 # =====================================================================
 # KB из HF Hub (обход ограничения _resolve_kb_path)
@@ -168,25 +247,28 @@ _HF_SPECIFIC_KEYS = {
 }
 
 
-def _clone_model(template: PyAgentPrologModel) -> PyAgentPrologModel:
-    """Изолированный клон: свой Database, свои actions, свой tracer."""
+def _clone_model(template) -> Any:
+    """Клон для HITL. Работает и для HF, и для standalone."""
+    if isinstance(template, _StandaloneModel):
+        clone = _StandaloneModel(
+            template.config.program, template.config.__dict__)
+        for meta in template.agent._actions.values():
+            clone.agent.register_action(meta['function'])
+        return clone
+
+    # HF-ветка — импорт только здесь
+    PyCfg, PyModel = _import_hf()
     cfg_dict = template.config.to_dict()
     for k in _HF_SPECIFIC_KEYS:
         cfg_dict.pop(k, None)
-
-    clone = PyAgentPrologModel(PyAgentPrologConfig(**cfg_dict))
+    clone = PyModel(PyCfg(**cfg_dict))
     clone.name_or_path = template.name_or_path
     clone._model_dir = template._model_dir
     clone._ensure_solver()
-
-    # KB из Hub, если это HF-модель
     if template.name_or_path and template.name_or_path != '<inline>':
         _ensure_kb_loaded(clone)
-
-    # Копируем все действия (пользовательские + gradio_* + ui_*)
     for meta in template.agent._actions.values():
         clone.agent.register_action(meta['function'])
-
     return clone
 
 
@@ -217,27 +299,25 @@ class Agent:
         self._lock = threading.RLock()
 
     # ------------------------------------------------------------------
-    # Декоратор программы
+    # Программа агента
     # ------------------------------------------------------------------
-    def program(self, source):
-        """Дополнительный Prolog, сливается с базой.
+    program = _ProgramDescriptor()
 
-        @agent.program
-        PROGRAM = "..."
-        """
+    def _set_program(self, source):
         if isinstance(source, str):
             text = source
         elif callable(source):
             text = source()
             if not isinstance(text, str):
                 raise TypeError(
-                    f"program function must return str, got {type(text).__name__}")
+                    f"program function must return str, got "
+                    f"{type(text).__name__}")
         else:
             raise TypeError(
-                f"program must be str or callable, got {type(source).__name__}")
+                f"program must be str or callable, got "
+                f"{type(source).__name__}")
         self._program = (self._program + "\n" + text).strip()
         self._invalidate()
-        return source
 
     # ------------------------------------------------------------------
     # Декораторы действий
@@ -390,18 +470,18 @@ class Agent:
                 except Exception:
                     pass
 
-    def build(self, *, with_ui: bool = False) -> PyAgentPrologModel:
+    def build(self, *, with_ui: bool = False):
         with self._lock:
             if self._model is not None:
                 return self._model
 
+            t0 = _time.time()
             if self._hub_source:
-                # --- HF-модель как база ---
+                # --- HF-путь: импорт transformers/torch неизбежен ---
+                PyCfg, PyModel = _import_hf()
                 repo, rev = self._hub_source
-                model = PyAgentPrologModel.from_pretrained(
-                    repo,
-                    revision=rev,
-                    trust_remote_code=True,
+                model = PyModel.from_pretrained(
+                    repo, revision=rev, trust_remote_code=True,
                     local_files_only=os.getenv('FONA_LOCAL_ONLY', '0')
                         .lower() in ('1', 'true'),
                     token=os.getenv('FONA_HF_TOKEN') or None,
@@ -414,8 +494,6 @@ class Agent:
                         .lower() in ('1', 'true'),
                     revision=rev,
                 )
-
-                # Пользовательский Prolog — PREPEND (ваши правила первыми)
                 if self._program:
                     rules, directives = Parser(self._program).parse_rules(
                         return_directives=True)
@@ -424,20 +502,18 @@ class Agent:
                         model.agent.solver.database.add_rule(
                             r, at_beginning=True)
             else:
-                # --- только пользовательская программа ---
-                config = PyAgentPrologConfig(
-                    program=self._program, **self._config_overrides)
-                model = PyAgentPrologModel(config)
-                model._ensure_solver()
+                # --- Standalone: без torch, без transformers ---
+                model = _StandaloneModel(self._program, self._config_overrides)
 
-            # Пользовательские действия
+            _log(f"build(): {_time.time()-t0:.2f}s "
+                 f"({'HF' if self._hub_source else 'standalone'})")
+
             for w in self._actions:
                 model.agent.register_action(w)
 
-            # configure() поверх загруженного (для HF)
-            self._apply_overrides(model)
+            if self._hub_source:
+                self._apply_overrides(model)
 
-            # UI-действия
             if with_ui:
                 self._install_ui_actions(model.agent)
 

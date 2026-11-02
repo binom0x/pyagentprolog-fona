@@ -3,17 +3,19 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import sys
 import threading
+import time as _time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import uvicorn
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
-from pyagentprolog_hf import PyAgentPrologModel
 from prolog.proagent_gradio import (
     AgentGradioSession, get_session, register_session,
     remove_session, send_input_to_agent,
@@ -21,6 +23,9 @@ from prolog.proagent_gradio import (
 
 from .agent import _clone_model
 from .ui import HTML
+
+if TYPE_CHECKING:
+    from pyagentprolog_hf import PyAgentPrologModel
 
 
 # =====================================================================
@@ -77,7 +82,7 @@ class _QueryRequest(BaseModel):
 # FastAPI
 # =====================================================================
 def create_app(
-    model: PyAgentPrologModel,
+    model: Any,
     *,
     start_query: str = 'run.',
     with_ui: bool = True,
@@ -98,11 +103,15 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app):
-        try:
-            from prolog.arith_numba import warmup_arith_numba
-            warmup_arith_numba()
-        except Exception:
-            pass
+        if os.getenv('FONA_WARMUP') == '1':
+            try:
+                from prolog.arith_numba import warmup_arith_numba
+                t0 = _time.time()
+                warmup_arith_numba()
+                print(f"[fona] numba warmup: {_time.time()-t0:.2f}s",
+                      file=sys.stderr, flush=True)
+            except Exception:
+                pass
         yield
 
     app = FastAPI(title="Fona Agent", version="0.1.0", lifespan=lifespan)
@@ -190,13 +199,12 @@ def create_app(
             cfg = model.config
             return {
                 'name_or_path': getattr(model, 'name_or_path', None),
-                'rules_count': len(model.database.rules),
-                'kb_file': cfg.kb_file,
-                'kb_format': cfg.kb_format,
-                'semantic_enabled': bool(cfg.semantic_enabled),
-                'semantic_backend': cfg.semantic_backend if cfg.semantic_enabled else None,
-                'default_main': cfg.default_main,
-                'max_solutions': cfg.max_solutions,
+                'rules_count': len(model.agent.solver.database.rules),
+                'kb_file': getattr(cfg, 'kb_file', None),
+                'kb_format': getattr(cfg, 'kb_format', 'auto'),
+                'semantic_enabled': bool(getattr(cfg, 'semantic_enabled', False)),
+                'default_main': getattr(cfg, 'default_main', None),
+                'max_solutions': getattr(cfg, 'max_solutions', 0),
                 'actions': model.agent.list_actions(),
             }
 
@@ -204,20 +212,24 @@ def create_app(
         def query_endpoint(req: _QueryRequest,
                            x_api_key: Optional[str] = Header(default=None)):
             check_token(x_api_key)
-            kwargs = {}
-            if req.with_explanation is not None:
-                kwargs['with_explanation'] = req.with_explanation
             with api_lock:
-                out = model.generate([req.query], **kwargs)
-            if out.errors and out.errors[0]:
+                raw = model.agent.query(req.query)
+
+            if not isinstance(raw, dict):
                 return {"success": False, "query": req.query,
-                        "error": out.errors[0]}
-            sols = out.solutions[0] if out.solutions else []
+                        "error": f"unexpected result: {type(raw).__name__}"}
+            if 'error' in raw:
+                return {"success": False, "query": req.query,
+                        "error": f"{raw.get('type', 'error')}: "
+                                 f"{raw.get('detail', raw['error'])}"}
+
+            sol = raw.get('solution')
+            success = sol is not None and sol is not False
             return {
-                "success": bool(sols),
+                "success": success,
                 "query": req.query,
-                "solutions": sols,
-                "count": out.count,
+                "solutions": sol if success else [],
+                "count": raw.get('count', 0),
             }
 
         @app.post("/api/v1/query_one")
