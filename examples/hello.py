@@ -1,3 +1,4 @@
+import os
 from fona import agent
 
 agent.program("""
@@ -13,5 +14,5 @@ loop :-
 """)
 
 if __name__ == '__main__':
-    agent.run()
-    # agent.run(background=True)
+    port = int(os.environ.get("FONA_PORT", "8010"))
+    agent.run(port=port)

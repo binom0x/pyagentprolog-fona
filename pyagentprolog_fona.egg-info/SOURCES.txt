@@ -3,6 +3,8 @@ pyproject.toml
 fona/__init__.py
 fona/agent.py
 fona/app.py
+fona/dashboard.py
+fona/orchestrator_app.py
 fona/server.py
 fona/ui.py
 fona/assets/favicon.png

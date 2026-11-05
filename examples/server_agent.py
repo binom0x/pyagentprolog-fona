@@ -1,3 +1,4 @@
+import os
 from fona import agent
 
 agent.program("""
@@ -9,4 +10,5 @@ run :- ui_print('Сервер фактов готов.').
 """)
 
 if __name__ == '__main__':
-    agent.run(port=8000)
+    port = int(os.environ.get("FONA_PORT", "8000"))
+    agent.run(port=port)

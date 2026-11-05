@@ -33,4 +33,5 @@ include = ["fona*"]
 fona = ["assets/*", "favicon.*"]
 
 [project.scripts]
-fona-chat = "fona.app:main"
+fona-orchestrator = "fona.orchestrator_app:main"
+fona-dashboard = "fona.dashboard:main"

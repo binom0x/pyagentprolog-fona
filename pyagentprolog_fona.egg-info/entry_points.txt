@@ -1,2 +1,3 @@
 [console_scripts]
-fona-chat = fona.app:main
+fona-dashboard = fona.dashboard:main
+fona-orchestrator = fona.orchestrator_app:main
