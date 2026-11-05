@@ -1,4 +1,4 @@
-"""Agent, декораторы, сборка модели, запуск."""
+"""Agent, decorators, model assembly, launch."""
 from __future__ import annotations
 
 import functools
@@ -13,7 +13,7 @@ from prolog.parser import Parser
 from prolog.terms import Variable
 
 # =====================================================================
-# Ленивые импорты и standalone-модель (без torch/transformers)
+# Lazy imports and standalone model (no torch/transformers)
 # =====================================================================
 import time as _time
 from types import SimpleNamespace
@@ -24,7 +24,7 @@ def _log(msg: str):
 
 
 def _import_hf():
-    """Импортирует pyagentprolog_hf ТОЛЬКО по требованию (HF-путь)."""
+    """Imports pyagentprolog_hf ONLY on demand (HF path)."""
     t0 = _time.time()
     from pyagentprolog_hf import PyAgentPrologConfig, PyAgentPrologModel
     _log(f"import pyagentprolog_hf: {_time.time()-t0:.2f}s")
@@ -32,9 +32,9 @@ def _import_hf():
 
 
 class _StandaloneModel:
-    """Лёгкий duck-type PyAgentPrologModel без torch/transformers.
+    """Lightweight duck-type of PyAgentPrologModel without torch/transformers.
 
-    Реализует ровно те атрибуты, которые использует fona.server:
+    Implements exactly the attributes used by fona.server:
         .agent, .config, .add_facts(...), .name_or_path, ._model_dir
     """
 
@@ -45,7 +45,7 @@ class _StandaloneModel:
         self.name_or_path = '<inline>'
         self._model_dir = None
 
-        # Минимальный config для /api/v1/model и _start_query
+        # Minimal config for /api/v1/model and _start_query
         defaults = dict(
             program=program, kb_file=None, kb_format='auto',
             semantic_enabled=False, semantic_backend='st',
@@ -69,7 +69,7 @@ class _StandaloneModel:
         return f"_StandaloneModel(rules={len(self.agent.solver.database.rules)})"
 
 # =====================================================================
-# Обёртки: Python-функция → Prolog-предикат
+# Wrappers: Python function -> Prolog predicate
 # =====================================================================
 def _tag(w, name, arity, func, kind):
     w._is_prolog_predicate = True
@@ -165,24 +165,24 @@ def _wrap_generator(func, name, arity, out):
     return _tag(w, name, arity, func, 'generator')
 
 # =====================================================================
-# Дескриптор, позволяющий три формы определения программы агента: 
-#   agent.program = """..."""          # присваивание
-#   agent.program("""...""")           # вызов
-#   @agent.program                     # декоратор на def
+# Descriptor enabling three forms of agent program definition:
+#   agent.program = """..."""          # assignment
+#   agent.program("""...""")           # call
+#   @agent.program                     # decorator on def
 #   def _(): return "..."
 # =====================================================================
 class _ProgramSetter:
-    """Callable-вид agent.program для формы agent.program('...')."""
+    """Callable view of agent.program for the form agent.program('...')."""
     __slots__ = ('_agent',)
     def __init__(self, agent):
         self._agent = agent
     def __call__(self, source):
         self._agent._set_program(source)
-        return source     # для @-декоратора: имя функции остаётся функцией
+        return source     # for @-decorator: the function name stays a function
 
 
 class _ProgramDescriptor:
-    """Дескриптор: agent.program = ... ИЛИ agent.program(...) ИЛИ @agent.program."""
+    """Descriptor: agent.program = ... OR agent.program(...) OR @agent.program."""
     def __get__(self, obj, objtype=None):
         if obj is None:
             return self
@@ -191,7 +191,7 @@ class _ProgramDescriptor:
         obj._set_program(value)
 
 # =====================================================================
-# KB из HF Hub (обход ограничения _resolve_kb_path)
+# KB from HF Hub (workaround for _resolve_kb_path limitation)
 # =====================================================================
 def _ensure_kb_loaded(
     model: PyAgentPrologModel,
@@ -200,7 +200,7 @@ def _ensure_kb_loaded(
     local_only: bool = False,
     revision: Optional[str] = None,
 ) -> bool:
-    """Загружает kb_file, если _ensure_solver не нашёл его локально."""
+    """Loads kb_file if _ensure_solver did not find it locally."""
     if not model.config.kb_file:
         return False
     resolved = model._resolve_kb_path(model.config.kb_file)
@@ -231,7 +231,7 @@ def _ensure_kb_loaded(
 
 
 # =====================================================================
-# Клонирование модели для HITL-сессии
+# Model cloning for HITL session
 # =====================================================================
 _HF_SPECIFIC_KEYS = {
     'architectures', 'auto_map', 'torch_dtype', 'transformers_version',
@@ -248,7 +248,7 @@ _HF_SPECIFIC_KEYS = {
 
 
 def _clone_model(template) -> Any:
-    """Клон для HITL. Работает и для HF, и для standalone."""
+    """Clone for HITL. Works for both HF and standalone."""
     if isinstance(template, _StandaloneModel):
         clone = _StandaloneModel(
             template.config.program, template.config.__dict__)
@@ -256,7 +256,7 @@ def _clone_model(template) -> Any:
             clone.agent.register_action(meta['function'])
         return clone
 
-    # HF-ветка — импорт только здесь
+    # HF branch — import only here
     PyCfg, PyModel = _import_hf()
     cfg_dict = template.config.to_dict()
     for k in _HF_SPECIFIC_KEYS:
@@ -276,17 +276,17 @@ def _clone_model(template) -> Any:
 # Agent
 # =====================================================================
 class Agent:
-    """Фоновый ИИ-агент с декларативной логикой на Prolog.
+    """Background AI agent with declarative logic in Prolog.
 
-    Минимальный пример:
+    Minimal example:
         a = Agent()
         @a.program
         PROGRAM = "run :- ui_print('hi')."
         a.run()
 
-    С HF-моделью:
+    With an HF model:
         a = Agent.from_hub('user/repo')
-        @a.program PROGRAM = "..."   # добавляется к config.program модели
+        @a.program PROGRAM = "..."   # appended to the model's config.program
         a.run()
     """
 
@@ -299,7 +299,7 @@ class Agent:
         self._lock = threading.RLock()
 
     # ------------------------------------------------------------------
-    # Программа агента
+    # Agent program
     # ------------------------------------------------------------------
     program = _ProgramDescriptor()
 
@@ -320,19 +320,19 @@ class Agent:
         self._invalidate()
 
     # ------------------------------------------------------------------
-    # Декораторы действий
+    # Action decorators
     # ------------------------------------------------------------------
     def action(self, func=None, *, name=None, arity=None, output_arg=None):
-        """@agent.action — предикат, возвращающий значение.
+        """@agent.action — predicate that returns a value.
 
         @agent.action
         def ask(prompt):
-            return llm(prompt)         # → ask/2, output_arg=1
+            return llm(prompt)         # -> ask/2, output_arg=1
 
         @agent.action(name='ask_llm', arity=2, output_arg=1)
         def ask(prompt): ...
 
-        Если функция содержит yield, автоматически становится генератором.
+        If the function contains yield, it becomes a generator automatically.
         """
         if func is None:
             return lambda f: self.action(f, name=name, arity=arity,
@@ -348,7 +348,7 @@ class Agent:
         return func
 
     def effect(self, func=None, *, name=None, arity=None):
-        """@agent.effect — side effect, без возврата. Всегда успешно.
+        """@agent.effect — side effect, no return value. Always succeeds.
 
         @agent.effect
         def ui_print(text):
@@ -364,12 +364,12 @@ class Agent:
         return func
 
     def generate(self, func=None, *, name=None, arity=None, output_arg=None):
-        """@agent.generate — генератор решений.
+        """@agent.generate — solution generator.
 
         @agent.generate
         def rooms():
             yield "kitchen"
-            yield "bedroom"         # → rooms/1
+            yield "bedroom"         # -> rooms/1
         """
         if func is None:
             return lambda f: self.generate(f, name=name, arity=arity,
@@ -387,29 +387,29 @@ class Agent:
     # ------------------------------------------------------------------
     @classmethod
     def from_hub(cls, repo_or_path: str, *, revision: Optional[str] = None):
-        """Загрузить PyAgentProlog-HF модель как базу.
+        """Load a PyAgentProlog-HF model as the base.
 
-        repo_or_path — HF Hub ID ('user/repo') или локальная директория.
-        Программу и действия можно доопределить через декораторы.
+        repo_or_path — HF Hub ID ('user/repo') or a local directory.
+        Program and actions can be added later via decorators.
         """
         inst = cls()
         inst._hub_source = (repo_or_path, revision)
         return inst
 
-    # Alias для совместимости с HF-конвенцией
+    # Alias for compatibility with HF conventions
     from_pretrained = from_hub
 
     def load_hub(self, repo_or_path: str, *, revision: Optional[str] = None):
-        """Использовать HF-модель как базу (для синглтона)."""
+        """Use an HF model as the base (for the singleton)."""
         self._hub_source = (repo_or_path, revision)
         self._invalidate()
         return self
 
     # ------------------------------------------------------------------
-    # Конфигурация
+    # Configuration
     # ------------------------------------------------------------------
     def configure(self, **kwargs):
-        """Переопределения параметров после загрузки.
+        """Overrides applied after loading.
 
         agent.configure(
             semantic_enabled=True,
@@ -424,7 +424,7 @@ class Agent:
         return self
 
     # ------------------------------------------------------------------
-    # Сборка модели
+    # Model assembly
     # ------------------------------------------------------------------
     def _invalidate(self):
         with self._lock:
@@ -436,7 +436,7 @@ class Agent:
             return
         cfg = model.config
 
-        # semantic — только для HF (для standalone уже применено через config)
+        # semantic — HF only (for standalone it is already applied via config)
         if self._hub_source is not None and o.get('semantic_enabled'):
             try:
                 from prolog.embedding_unify import semantic_on
@@ -459,7 +459,7 @@ class Agent:
                 except Exception:
                     pass
 
-        # прочие ключи — best effort
+        # other keys — best effort
         handled = {'semantic_enabled', 'semantic_threshold', 'semantic_model',
                    'semantic_backend', 'max_solutions', 'with_explanation',
                    'default_main'}
@@ -477,7 +477,7 @@ class Agent:
 
             t0 = _time.time()
             if self._hub_source:
-                # --- HF-путь: импорт transformers/torch неизбежен ---
+                # --- HF path: importing transformers/torch is unavoidable ---
                 PyCfg, PyModel = _import_hf()
                 repo, rev = self._hub_source
                 model = PyModel.from_pretrained(
@@ -502,7 +502,7 @@ class Agent:
                         model.agent.solver.database.add_rule(
                             r, at_beginning=True)
             else:
-                # --- Standalone: без torch, без transformers ---
+                # --- Standalone: no torch, no transformers ---
                 model = _StandaloneModel(self._program, self._config_overrides)
 
             _log(f"build(): {_time.time()-t0:.2f}s "
@@ -522,23 +522,23 @@ class Agent:
 
     @staticmethod
     def _install_ui_actions(agent_obj):
-        """Регистрирует ui_print/ui_read + gradio_*-совместимые имена."""
+        """Registers ui_print/ui_read + gradio_*-compatible names."""
         from prolog.proagent_gradio import register_gradio_actions
         from prolog.actions import effector_action, simple_action
 
-        # Стандартные gradio_* — для совместимости с документацией
+        # Standard gradio_* — for documentation compatibility
         register_gradio_actions(agent_obj)
 
-        # Канонические алиасы для Fona
+        # Canonical aliases for Fona
         @effector_action('ui_print', 1,
-                         description='Печать в UI-лог')
+                         description='Print to the UI log')
         def ui_print(text, context):
             session = context.get('agent_session')
             if session is not None:
                 session.add_output(text)
 
         @simple_action('ui_read', 1, output_arg=0,
-                       description='Ожидание ввода из UI')
+                       description='Wait for UI input')
         def ui_read(context):
             session = context.get('agent_session')
             if session is None:
@@ -549,7 +549,7 @@ class Agent:
         agent_obj.register_action(ui_read)
 
     # ------------------------------------------------------------------
-    # Стартовая цель
+    # Start goal
     # ------------------------------------------------------------------
     def _start_query(self, model: PyAgentPrologModel) -> str:
         db = model.agent.solver.database
@@ -568,7 +568,7 @@ class Agent:
         return "run."
 
     # ------------------------------------------------------------------
-    # Программный доступ (без HTTP)
+    # Programmatic access (no HTTP)
     # ------------------------------------------------------------------
     def query(self, q: str) -> dict:
         return self.build().agent.query(q)
@@ -583,7 +583,7 @@ class Agent:
         return self.query(q)
 
     # ------------------------------------------------------------------
-    # Запуск
+    # Launch
     # ------------------------------------------------------------------
     def run(
         self,
@@ -594,9 +594,9 @@ class Agent:
         token: Optional[str] = None,
         background: bool = False,
     ):
-        """Запустить агента.
+        """Start the agent.
 
-        background=True → pythonw без окна (Windows).
+        background=True -> pythonw without a console window (Windows).
         """
         if os.environ.get('FONA_CHILD') == '1':
             background = False
@@ -649,5 +649,5 @@ class Agent:
         print(f"[fona] spawned background: {exe} {script}")
 
 
-# Синглтон для быстрого старта
+# Singleton for quick start
 agent = Agent()

@@ -1,4 +1,4 @@
-"""FastAPI + SSE + HITL-сессии."""
+"""FastAPI + SSE + HITL sessions."""
 from __future__ import annotations
 
 import asyncio
@@ -29,14 +29,14 @@ if TYPE_CHECKING:
 
 
 # =====================================================================
-# Сессия с семантикой query_one (только первое решение run.)
+# Session with query_one semantics (only the first solution of run/0)
 # =====================================================================
 class QueryOneSession(AgentGradioSession):
-    """HITL-сессия: вызывает query_one вместо query.
+    """HITL session that calls query_one instead of query.
 
-    Это правильно для «один агент = один жизненный цикл»:
-    если в программе переопределён run/0, HF-ный run/0 не будет
-    выполняться вдогонку.
+    This is correct for "one agent = one lifecycle":
+    if the program overrides run/0, the HF-side run/0 will not
+    be executed afterwards.
     """
 
     def _run(self, agent, query):
@@ -46,13 +46,13 @@ class QueryOneSession(AgentGradioSession):
             agent.context['agent_session'] = self
             result = agent.query_one(query)
             if result is None:
-                self.add_output("Агент завершил выполнение без решений.")
+                self.add_output("Agent finished without solutions.")
             elif result.get('__success__'):
-                self.add_output("Агент завершил выполнение.")
+                self.add_output("Agent finished execution.")
             else:
-                self.add_output(f"Результат: {result}")
+                self.add_output(f"Result: {result}")
         except Exception as e:
-            self.add_output(f"Ошибка: {type(e).__name__}: {e}")
+            self.add_output(f"Error: {type(e).__name__}: {e}")
         finally:
             self.running = False
             self.thread = None
@@ -65,7 +65,7 @@ def _create_query_one_session() -> str:
 
 
 # =====================================================================
-# Схемы
+# Schemas
 # =====================================================================
 class _InputRequest(BaseModel):
     session_id: str
@@ -89,11 +89,12 @@ def create_app(
     with_rest: bool = True,
     token: Optional[str] = None,
 ) -> FastAPI:
-    """Собрать FastAPI-приложение с UI и/или REST.
+    """Build a FastAPI application with UI and/or REST.
 
-    Database не потокобезопасна (interpreter.py мутирует rules,
-    _cut_counter, tracer). Все REST-запросы к шаблонной модели идут
-    под api_lock. HITL-сессии изолированы: своя модель = свой Database.
+    The Database is not thread-safe (interpreter.py mutates rules,
+    _cut_counter, tracer). All REST requests against the template model
+    run under api_lock. HITL sessions are isolated: each has its own
+    model, i.e. its own Database.
     """
     api_lock = threading.RLock()
 

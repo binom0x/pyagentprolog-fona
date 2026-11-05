@@ -2,10 +2,13 @@ README.md
 pyproject.toml
 fona/__init__.py
 fona/agent.py
+fona/app.py
 fona/server.py
 fona/ui.py
+fona/assets/favicon.png
 pyagentprolog_fona.egg-info/PKG-INFO
 pyagentprolog_fona.egg-info/SOURCES.txt
 pyagentprolog_fona.egg-info/dependency_links.txt
+pyagentprolog_fona.egg-info/entry_points.txt
 pyagentprolog_fona.egg-info/requires.txt
 pyagentprolog_fona.egg-info/top_level.txt

@@ -28,3 +28,9 @@ all = ["torch>=2.0", "sentence-transformers>=3.0"]
 
 [tool.setuptools.packages.find]
 include = ["fona*"]
+
+[tool.setuptools.package-data]
+fona = ["assets/*", "favicon.*"]
+
+[project.scripts]
+fona-chat = "fona.app:main"

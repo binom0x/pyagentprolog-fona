@@ -1,0 +1,2 @@
+[console_scripts]
+fona-chat = fona.app:main
