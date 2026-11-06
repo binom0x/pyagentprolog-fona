@@ -1,8 +1,10 @@
 """HTML page for the Fona agent UI. Inlined as a Python string.
 
-Runtime language switcher in the header (EN / RU).
-Choice is persisted in localStorage; on first visit it is detected
-from the browser locale (falls back to English).
+Interface language is auto-detected from the system/browser locale:
+  * Russian if the first preferred language starts with "ru"
+  * English for everything else
+No manual switcher, no localStorage persistence — the language is
+recomputed on every page load so a changed OS locale is picked up.
 """
 
 HTML = r"""<!DOCTYPE html>
@@ -32,13 +34,6 @@ header {
 }
 header h1 { margin: 0; font-size: 1rem; font-weight: 600; }
 header .spacer { flex: 1; }
-header select {
-  background: #21262d; color: var(--fg);
-  border: 1px solid var(--border); border-radius: 4px;
-  padding: 4px 8px; font-size: 12px; cursor: pointer;
-  font-family: ui-monospace, monospace;
-}
-header select:focus { outline: none; border-color: var(--accent); }
 
 .status-badge {
   font-size: 11px; padding: 2px 8px; border-radius: 10px;
@@ -150,10 +145,6 @@ pre.status {
   <span class="status-badge off" id="badge">offline</span>
   <span class="url" id="agent-url"></span>
   <div class="spacer"></div>
-  <select id="lang-select" title="Language">
-    <option value="en">EN</option>
-    <option value="ru">RU</option>
-  </select>
   <button id="reconnect" data-i18n="reconnect">🔄</button>
 </header>
 
@@ -280,7 +271,6 @@ pre.status {
     }
   };
 
-  const LANG_STORAGE_KEY = 'fona.lang';
   let currentLang = 'en';
 
   function t(key, vars) {
@@ -297,22 +287,43 @@ pre.status {
   }
 
   // ====================================================================
-  // Language handling
+  // Language detection — system/browser locale only.
+  //
+  // Rule: Russian if the first preferred language starts with "ru",
+  // English for everything else.
+  //
+  // Sources, in order of priority:
+  //   1. navigator.languages[0]  (full preference list, most reliable)
+  //   2. navigator.language
+  //   3. Intl.DateTimeFormat().resolvedOptions().locale
+  //   4. "en"
+  //
+  // No localStorage, no manual switcher: a changed OS locale must be
+  // picked up on the next page load without any "sticky" override.
   // ====================================================================
   function detectLang() {
+    let lang = '';
+
     try {
-      const saved = localStorage.getItem(LANG_STORAGE_KEY);
-      if (saved === 'en' || saved === 'ru') return saved;
+      if (Array.isArray(navigator.languages) && navigator.languages.length) {
+        lang = navigator.languages[0] || '';
+      }
     } catch (_) {}
-    const nav = (navigator.language || 'en').toLowerCase();
-    return nav.startsWith('ru') ? 'ru' : 'en';
+    if (!lang) {
+      try { lang = navigator.language || ''; } catch (_) {}
+    }
+    if (!lang) {
+      try {
+        lang = (Intl.DateTimeFormat().resolvedOptions().locale) || '';
+      } catch (_) {}
+    }
+
+    lang = String(lang).toLowerCase();
+    return lang.startsWith('ru') ? 'ru' : 'en';
   }
 
   function applyLang(lang) {
     currentLang = (lang === 'ru') ? 'ru' : 'en';
-    try {
-      localStorage.setItem(LANG_STORAGE_KEY, currentLang);
-    } catch (_) {}
     document.documentElement.lang = currentLang;
     document.title = t('title');
 
@@ -328,9 +339,6 @@ pre.status {
 
     updateBadge();
     renderDataStatus();
-
-    const sel = document.getElementById('lang-select');
-    if (sel && sel.value !== currentLang) sel.value = currentLang;
   }
 
   // ====================================================================
@@ -532,10 +540,6 @@ pre.status {
   // ====================================================================
   $('reconnect').onclick = async () => { await connect(); };
 
-  $('lang-select').onchange = (e) => {
-    applyLang(e.target.value);
-  };
-
   $('composer').onsubmit = (e) => {
     e.preventDefault();
     const txt = $('user-msg').value;
@@ -572,6 +576,7 @@ pre.status {
       url: ORIGIN,
       session_id: sessionId,
       running: running,
+      lang: currentLang,
     }, null, 2);
   }, 500);
 

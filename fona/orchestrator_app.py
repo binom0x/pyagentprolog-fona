@@ -4,18 +4,29 @@ Runs as a separate process, talks to the orchestrator's HTML UI via:
   * /api/v1/ui/*        — chat (HITL session)
   * /orch/*             — orchestration state (goal, tasks, subordinates)
 
+Three-column layout (same as fona/dashboard.py):
+  * left   (scale=2): Goal + input + Open HTML
+  * center (scale=5): Plan (3 task columns) + Chat
+  * right  (scale=2): Logs + Subordinates + connection status
+
+System-language detection, no manual switcher.
+
 Run:
     python -m fona.orchestrator_app --orchestrator http://127.0.0.1:8000 \
                                     --port 8010
+    FONA_DASHBOARD_LANG=ru python -m fona.orchestrator_app \
+        --orchestrator http://127.0.0.1:8000 --port 8010
 """
 from __future__ import annotations
 
 import argparse
 import json
+import locale as _locale
 import os
+import sys
 import time as _t
 from html import escape as _esc
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 import gradio as gr
 import httpx
@@ -40,6 +51,7 @@ TRANSLATIONS = {
         "message_placeholder": "Message to orchestrator...",
         "send": "Send",
         "logs": "Logs",
+        "status": "Status",
         "not_connected": "Not connected",
         "connected": "Connected",
         "pending": "Pending",
@@ -51,6 +63,11 @@ TRANSLATIONS = {
         "no_subordinates": "No subordinates configured.",
         "goal_set": "Goal set",
         "connect_error": "Connect error",
+        "url_placeholder": "http://127.0.0.1:8000",
+        "refresh": "Refresh",
+        "env_hint": (
+            "Orchestrator URL from --orchestrator / FONA_ORCHESTRATOR. "
+            "Click Connect to open a HITL session."),
     },
     "ru": {
         "title": "Оркестратор Fona",
@@ -67,6 +84,7 @@ TRANSLATIONS = {
         "message_placeholder": "Сообщение оркестратору...",
         "send": "Отправить",
         "logs": "Логи",
+        "status": "Состояние",
         "not_connected": "Не подключено",
         "connected": "Подключено",
         "pending": "Ожидает",
@@ -78,6 +96,11 @@ TRANSLATIONS = {
         "no_subordinates": "Подчинённые не заданы.",
         "goal_set": "Цель установлена",
         "connect_error": "Ошибка подключения",
+        "url_placeholder": "http://127.0.0.1:8000",
+        "refresh": "Обновить",
+        "env_hint": (
+            "URL оркестратора берётся из --orchestrator / FONA_ORCHESTRATOR. "
+            "Нажмите «Подключиться», чтобы открыть HITL-сессию."),
     },
 }
 
@@ -86,6 +109,38 @@ def t(lang: str, key: str, **kwargs) -> str:
     table = TRANSLATIONS.get(lang) or TRANSLATIONS["en"]
     template = table.get(key) or TRANSLATIONS["en"].get(key, key)
     return template.format(**kwargs) if kwargs else template
+
+
+# ============================================================================
+# System language detection (same logic as fona/dashboard.py)
+# ============================================================================
+def _detect_system_lang() -> str:
+    override = os.environ.get("FONA_DASHBOARD_LANG", "").strip().lower()
+    if override in ("en", "ru"):
+        return override
+
+    try:
+        loc = (_locale.getlocale()[0] or "").lower()
+        if loc.startswith("ru"):
+            return "ru"
+    except (ValueError, TypeError, AttributeError):
+        pass
+
+    for var in ("LANG", "LC_ALL", "LANGUAGE", "LC_MESSAGES"):
+        val = os.environ.get(var, "").lower()
+        if val.startswith("ru"):
+            return "ru"
+
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            lang_id = ctypes.windll.kernel32.GetUserDefaultUILanguage()
+            if (lang_id & 0x3FF) == 0x19:
+                return "ru"
+        except Exception:
+            pass
+
+    return "en"
 
 
 # ============================================================================
@@ -98,7 +153,7 @@ except (ValueError, AttributeError):
 _IS_GRADIO6 = _GRADIO_VERSION >= (6, 0)
 
 _CHATBOT_KWARGS = {
-    "height": 420, "show_label": False,
+    "height": 380, "show_label": False,
     "elem_classes": ["chat-panel"],
 }
 if not _IS_GRADIO6:
@@ -106,7 +161,7 @@ if not _IS_GRADIO6:
 
 
 # ============================================================================
-# CSS
+# CSS — same palette and control classes as fona/dashboard.py
 # ============================================================================
 _GLOBAL_CSS = """
 .gradio-container { max-width: 1900px !important; padding: 6px 8px !important;
@@ -121,11 +176,41 @@ button.compact-btn, .compact-btn button {
 button.compact-btn:hover, .compact-btn button:hover {
     background: #30363d !important; border-color: #3a4250 !important;
 }
-.compact-tb input, .compact-tb textarea {
+.gradio-container .compact-tb.block,
+.gradio-container .compact-tb > .block {
+    border: 1px solid #2a313d !important; border-radius: 4px !important;
+    background: #0b0d11 !important; box-shadow: none !important;
+    padding: 0 !important;
+}
+.gradio-container .compact-tb .block,
+.gradio-container .compact-tb .form,
+.gradio-container .compact-tb .wrap,
+.gradio-container .compact-tb .secondary-wrap,
+.gradio-container .compact-tb .wrap-inner,
+.gradio-container .compact-tb .container,
+.gradio-container .compact-tb .input-container,
+.gradio-container .compact-tb input,
+.gradio-container .compact-tb textarea,
+.gradio-container .compact-tb select {
+    border: 0 !important; background: transparent !important;
+    box-shadow: none !important; outline: none !important;
+    border-radius: 0 !important;
+}
+.gradio-container .compact-tb input,
+.gradio-container .compact-tb textarea,
+.gradio-container .compact-tb select {
     padding: 4px 8px !important; font-size: 12px !important;
-    min-height: 28px !important; background: #0b0d11 !important;
-    color: #c7cbd1 !important; border: 1px solid #2a313d !important;
-    border-radius: 4px !important;
+    min-height: 28px !important; color: #c7cbd1 !important;
+}
+.gradio-container .compact-tb > label,
+.gradio-container .compact-tb .label-wrap {
+    padding: 2px 8px 0 8px !important; font-size: 11px !important;
+    color: #8b949e !important;
+}
+.gradio-container .compact-tb.block:focus-within,
+.gradio-container .compact-tb > .block:focus-within {
+    border-color: #58a6ff !important;
+    box-shadow: 0 0 0 2px rgba(88,166,255,.2) !important;
 }
 .col-head {
     font-size: 14px !important; font-weight: 600;
@@ -138,7 +223,11 @@ pre.status-box {
     padding: 4px 8px; background: #0b0d11;
     border: 1px solid #2a313d; border-radius: 4px;
     color: #c7cbd1; white-space: pre-wrap;
-    max-height: 100px; overflow: auto;
+    max-height: 120px; overflow: auto;
+}
+.env-hint {
+    font-size: 11px; color: #8b949e; line-height: 1.35;
+    padding: 2px 4px; margin: 2px 0 6px 0;
 }
 .chat-panel { background: #0b0d11 !important;
               border: 1px solid #2a313d !important;
@@ -146,10 +235,18 @@ pre.status-box {
 *::-webkit-scrollbar { width: 8px; height: 8px; }
 *::-webkit-scrollbar-thumb { background: #2a313d; border-radius: 5px; }
 
+.goal-card {
+    padding: 10px; background: #0f1115;
+    border: 1px solid #2a313d; border-radius: 6px;
+    font-size: 13px; color: #c7cbd1;
+}
+.goal-card .goal-label { color: #8b949e; font-size: 11px;
+                          margin-bottom: 4px; }
+
 .task-board { display: grid; grid-template-columns: repeat(3, 1fr);
               gap: 8px; margin: 4px 0; }
 .task-col { background: #0f1115; border: 1px solid #2a313d;
-            border-radius: 6px; padding: 8px; min-height: 180px; }
+            border-radius: 6px; padding: 8px; min-height: 160px; }
 .task-col h4 { margin: 0 0 6px 0; font-size: 12px;
                color: #8b949e; font-weight: 600;
                text-transform: uppercase; letter-spacing: .5px; }
@@ -159,10 +256,15 @@ pre.status-box {
 .task-item.done   { border-left: 3px solid #238636; }
 .task-item.active { border-left: 3px solid #d29922; }
 .task-item.failed { border-left: 3px solid #d73a49; }
+.task-empty { color: #484f58; font-size: 11px;
+              text-align: center; padding: 8px; }
 
+.agent-list { background: #0f1115; border: 1px solid #2a313d;
+              border-radius: 6px; padding: 4px 0; }
 .agent-row { display: flex; align-items: center; gap: 8px;
-             padding: 4px 6px; border-bottom: 1px solid #161a20;
-             font-size: 12px; }
+             padding: 4px 8px; border-bottom: 1px solid #161a20;
+             font-size: 12px; color: #c7cbd1; }
+.agent-row:last-child { border-bottom: none; }
 .agent-dot { width: 8px; height: 8px; border-radius: 50%; }
 .agent-dot.online { background: #238636; }
 .agent-dot.offline { background: #d73a49; }
@@ -308,14 +410,14 @@ class OrchestratorClient:
         return []
 
 
-_state = {"client": None, "lang": "en"}
+_state = {"client": None}
 
 
 # ============================================================================
 # Rendering
 # ============================================================================
 def _status_html(s: str) -> str:
-    return f'<pre class="status-box">{_esc(s)}</pre>'
+    return f'<pre class="status-box">{_esc(str(s))}</pre>'
 
 
 def _render_goal(lang: str) -> str:
@@ -324,9 +426,9 @@ def _render_goal(lang: str) -> str:
     if not goal:
         return _status_html(t(lang, "no_goal"))
     return (
-        f'<div style="padding:10px;background:#0f1115;'
-        f'border:1px solid #2a313d;border-radius:6px;font-size:13px;">'
-        f'🎯 <b>{_esc(t(lang, "goal"))}:</b> {_esc(goal)}'
+        f'<div class="goal-card">'
+        f'<div class="goal-label">\U0001f3af {_esc(t(lang, "goal"))}</div>'
+        f'<div>{_esc(goal)}</div>'
         f'</div>'
     )
 
@@ -352,22 +454,21 @@ def _render_tasks(lang: str) -> str:
             f'{_esc(x.get("title") or x.get("id") or "?")}'
             f'</div>'
             for x in items
-        ) or f'<div style="color:#484f58;font-size:11px;' \
-            f'text-align:center;padding:8px">{t(lang, "empty_col")}</div>'
+        ) or f'<div class="task-empty">{t(lang, "empty_col")}</div>'
         return (f'<div class="task-col"><h4>{title} ({len(items)})</h4>'
                 f'{body}</div>')
 
     html = (
         '<div class="task-board">'
-        + col(f'⏳ {t(lang, "pending")}', groups["pending"], "active")
-        + col(f'⚙ {t(lang, "active")}', groups["active"], "active")
-        + col(f'✅ {t(lang, "done")}', groups["done"], "done")
+        + col(f'\u23f3 {t(lang, "pending")}', groups["pending"], "active")
+        + col(f'\u2699 {t(lang, "active")}', groups["active"], "active")
+        + col(f'\u2705 {t(lang, "done")}', groups["done"], "done")
         + "</div>"
     )
     if groups["failed"]:
         html += (
             f'<div style="color:#ff7b72;font-size:11px;margin-top:4px">'
-            f'⚠ {t(lang, "errors")}: {len(groups["failed"])}</div>'
+            f'\u26a0 {t(lang, "errors")}: {len(groups["failed"])}</div>'
         )
     return html
 
@@ -389,129 +490,113 @@ def _render_subordinates(lang: str) -> str:
             f'{_esc(a.get("url", ""))}</span>'
             f'</div>'
         )
-    return "".join(rows)
+    return f'<div class="agent-list">{"".join(rows)}</div>'
 
 
 # ============================================================================
 # UI
 # ============================================================================
 def build_ui() -> gr.Blocks:
-    _blocks_kwargs = {"title": "Fona Orchestrator"}
+    lang = _detect_system_lang()
+    print(f"[fona] orchestrator language: {lang} "
+          f"(override: FONA_DASHBOARD_LANG=en|ru)",
+          file=sys.stderr, flush=True)
+
+    _blocks_kwargs = {"title": t(lang, "title")}
     if not _IS_GRADIO6:
         _blocks_kwargs["css"] = _GLOBAL_CSS
         _blocks_kwargs["head"] = _HEAD_DARK
 
     with gr.Blocks(**_blocks_kwargs) as demo:
-        lang_state = gr.State("en")
 
-        # ---------- Top bar ----------
+        # ---------- Top bar: URL + Connect + Refresh ----------
         with gr.Row(equal_height=True):
-            lang_dropdown = gr.Dropdown(
-                choices=[("English", "en"), ("Русский", "ru")],
-                value="en", label="🌐", scale=0, min_width=130,
-            )
+            gr.HTML(f'<div class="col-head">\U0001f3af '
+                    f'{t(lang, "orchestrator")}</div>')
             orch_url = gr.Textbox(
-                value=os.getenv("FONA_ORCHESTRATOR", "http://127.0.0.1:8000"),
+                value=os.getenv("FONA_ORCHESTRATOR",
+                                "http://127.0.0.1:8000"),
+                placeholder=t(lang, "url_placeholder"),
                 show_label=False, scale=4,
                 elem_classes=["compact-tb"],
             )
             connect_btn = gr.Button(
-                "Connect", size="sm", variant="primary",
-                scale=1, elem_classes=["compact-btn"])
+                f"\U0001f517 {t(lang, 'connect')}", size="sm",
+                variant="primary", scale=1,
+                elem_classes=["compact-btn"])
             refresh_btn = gr.Button(
-                "🔄", size="sm", scale=0, min_width=0,
-                elem_classes=["compact-btn"])
-            html_btn = gr.Button(
-                "Open HTML ↗", size="sm", scale=1,
-                elem_classes=["compact-btn"])
-        status_html = gr.HTML(_status_html("Not connected"))
+                "\U0001f504", size="sm", scale=0, min_width=0,
+                elem_classes=["compact-btn"],
+                elem_id="orch_refresh_btn")
+        gr.HTML(f'<div class="env-hint">{t(lang, "env_hint")}</div>')
 
-        # ---------- Two columns ----------
+        # ---------- Three columns ----------
         with gr.Row(equal_height=False):
-            with gr.Column(scale=3, min_width=380):
-                goal_head = gr.HTML('<div class="col-head">🎯 Goal</div>')
-                goal_html = gr.HTML(_render_goal("en"))
+
+            # -------- Left: Goal + input + Open HTML --------
+            with gr.Column(scale=2, min_width=340):
+                gr.HTML(f'<div class="col-head">\U0001f3af '
+                        f'{t(lang, "goal")}</div>')
+                goal_html = gr.HTML(_render_goal(lang))
 
                 with gr.Row(equal_height=True):
                     goal_input = gr.Textbox(
-                        placeholder="Describe the task...",
+                        placeholder=t(lang, "goal_placeholder"),
                         show_label=False, lines=2, scale=4,
                         elem_classes=["compact-tb"])
                     set_goal_btn = gr.Button(
-                        "Set", size="sm", variant="primary",
+                        f"{t(lang, 'set_goal')}", size="sm",
+                        variant="primary", scale=1,
+                        elem_classes=["compact-btn"])
+
+                with gr.Row(equal_height=True):
+                    html_btn = gr.Button(
+                        f"{t(lang, 'open_html')} \u2197", size="sm",
                         scale=1, elem_classes=["compact-btn"])
 
-                plan_head = gr.HTML('<div class="col-head">📋 Plan</div>')
-                tasks_html = gr.HTML(_render_tasks("en"))
+            # -------- Center: Plan + Chat --------
+            with gr.Column(scale=5, min_width=520):
+                gr.HTML(f'<div class="col-head">\U0001f4cb '
+                        f'{t(lang, "plan")}</div>')
+                tasks_html = gr.HTML(_render_tasks(lang))
 
-                subs_head = gr.HTML('<div class="col-head">🤖 Subordinates</div>')
-                subs_html = gr.HTML(_render_subordinates("en"))
-
-            with gr.Column(scale=4, min_width=480):
-                chat_head = gr.HTML(
-                    '<div class="col-head">💬 Chat with orchestrator</div>')
+                gr.HTML(f'<div class="col-head">\U0001f4ac '
+                        f'{t(lang, "chat")}</div>')
                 chatbot = gr.Chatbot(**_CHATBOT_KWARGS)
 
                 with gr.Row(equal_height=True):
                     user_msg = gr.Textbox(
-                        placeholder="Message to orchestrator...",
+                        placeholder=t(lang, "message_placeholder"),
                         show_label=False, scale=4,
                         elem_classes=["compact-tb"])
                     send_btn = gr.Button(
-                        "Send", size="sm", variant="primary",
-                        scale=1, elem_classes=["compact-btn"])
+                        f"\u25b6 {t(lang, 'send')}", size="sm",
+                        variant="primary", scale=1,
+                        elem_classes=["compact-btn"])
 
-                logs_head = gr.HTML('<div class="col-head">📋 Logs</div>')
+            # -------- Right: Logs + Subordinates + Status --------
+            with gr.Column(scale=2, min_width=300):
+                gr.HTML(f'<div class="col-head">\U0001f4cb '
+                        f'{t(lang, "logs")}</div>')
                 logs_out = gr.Textbox(
-                    show_label=False, lines=10, interactive=False,
+                    show_label=False, lines=12, interactive=False,
                     elem_classes=["compact-tb"])
 
-        # ============================================================
-        # Timer
-        # ============================================================
+                gr.HTML(f'<div class="col-head">\U0001f916 '
+                        f'{t(lang, "subordinates")}</div>')
+                subs_html = gr.HTML(_render_subordinates(lang))
+
+                gr.HTML(f'<div class="col-head">\U0001f4a1 '
+                        f'{t(lang, "status")}</div>')
+                status_html = gr.HTML(
+                    _status_html(t(lang, "not_connected")))
+
         timer = gr.Timer(0.6)
-
-        # ============================================================
-        # Language change
-        # ============================================================
-        def _on_lang_change(choice):
-            lang = choice or "en"
-            return (
-                lang,
-                gr.update(value=f'<div class="col-head">'
-                                f'🎯 {t(lang, "goal")}</div>'),
-                gr.update(value=f'<div class="col-head">'
-                                f'📋 {t(lang, "plan")}</div>'),
-                gr.update(value=f'<div class="col-head">'
-                                f'🤖 {t(lang, "subordinates")}</div>'),
-                gr.update(value=f'<div class="col-head">'
-                                f'💬 {t(lang, "chat")}</div>'),
-                gr.update(value=f'<div class="col-head">'
-                                f'📋 {t(lang, "logs")}</div>'),
-                gr.update(value=t(lang, "connect")),
-                gr.update(value=f'{t(lang, "open_html")} ↗'),
-                gr.update(value=t(lang, "set_goal")),
-                gr.update(value=t(lang, "send")),
-                gr.update(placeholder=t(lang, "goal_placeholder")),
-                gr.update(placeholder=t(lang, "message_placeholder")),
-                _render_goal(lang),
-                _render_tasks(lang),
-                _render_subordinates(lang),
-            )
-
-        lang_dropdown.change(
-            _on_lang_change, [lang_dropdown],
-            [lang_state,
-             goal_head, plan_head, subs_head, chat_head, logs_head,
-             connect_btn, html_btn, set_goal_btn, send_btn,
-             goal_input, user_msg,
-             goal_html, tasks_html, subs_html],
-        )
 
         # ============================================================
         # Connect
         # ============================================================
-        def _connect(lang, url):
+        def _connect(url):
             url = (url or "").strip()
             if _state["client"] is not None:
                 _state["client"].stop()
@@ -520,7 +605,7 @@ def build_ui() -> gr.Blocks:
             if not client.health():
                 return (
                     _status_html(
-                        f"✗ {t(lang, 'connect_error')}: {url}"),
+                        f"\u2717 {t(lang, 'connect_error')}: {url}"),
                     _render_goal(lang),
                     _render_tasks(lang),
                     _render_subordinates(lang),
@@ -528,27 +613,36 @@ def build_ui() -> gr.Blocks:
             if not client.start():
                 return (
                     _status_html(
-                        f"✗ {t(lang, 'connect_error')}: session start"),
+                        f"\u2717 {t(lang, 'connect_error')}: session start"),
                     _render_goal(lang),
                     _render_tasks(lang),
                     _render_subordinates(lang),
                 )
             _state["client"] = client
             return (
-                _status_html(f"✓ {t(lang, 'connected')}: {url}"),
+                _status_html(f"\u2713 {t(lang, 'connected')}: {url}"),
                 _render_goal(lang),
                 _render_tasks(lang),
                 _render_subordinates(lang),
             )
 
         connect_btn.click(
-            _connect, [lang_state, orch_url],
+            _connect, [orch_url],
             [status_html, goal_html, tasks_html, subs_html])
+
+        # ============================================================
+        # Open HTML
+        # ============================================================
+        def _open_html(url):
+            url = (url or "").strip() or "http://127.0.0.1:8000"
+            return f'<script>window.open("{_esc(url)}", "_blank");</script>'
+
+        html_btn.click(_open_html, [orch_url], [status_html])
 
         # ============================================================
         # Refresh
         # ============================================================
-        def _refresh(lang):
+        def _refresh():
             return (
                 _render_goal(lang),
                 _render_tasks(lang),
@@ -556,31 +650,32 @@ def build_ui() -> gr.Blocks:
             )
 
         refresh_btn.click(
-            _refresh, [lang_state],
+            _refresh, [],
             [goal_html, tasks_html, subs_html])
 
         # ============================================================
         # Set goal
         # ============================================================
-        def _set_goal(lang, goal):
+        def _set_goal(goal):
             client: Optional[OrchestratorClient] = _state["client"]
             if client is None:
-                return _render_goal(lang), _status_html(
-                    t(lang, "not_connected"))
+                return (_render_goal(lang),
+                        _status_html(t(lang, "not_connected")))
             ok = client.set_goal(goal or "")
             return (
                 _render_goal(lang),
-                _status_html(f"✓ {t(lang, 'goal_set')}" if ok else "✗"),
+                _status_html(f"\u2713 {t(lang, 'goal_set')}"
+                             if ok else "\u2717"),
             )
 
         set_goal_btn.click(
-            _set_goal, [lang_state, goal_input],
+            _set_goal, [goal_input],
             [goal_html, status_html])
 
         # ============================================================
         # Chat
         # ============================================================
-        def _send(lang, text, history):
+        def _send(text, history):
             text = (text or "").strip()
             client: Optional[OrchestratorClient] = _state["client"]
             if not text or client is None:
@@ -591,16 +686,16 @@ def build_ui() -> gr.Blocks:
             return history, ""
 
         send_btn.click(
-            _send, [lang_state, user_msg, chatbot],
+            _send, [user_msg, chatbot],
             [chatbot, user_msg])
         user_msg.submit(
-            _send, [lang_state, user_msg, chatbot],
+            _send, [user_msg, chatbot],
             [chatbot, user_msg])
 
         # ============================================================
         # Polling
         # ============================================================
-        def _poll(lang, history, logs):
+        def _poll(history, logs):
             client: Optional[OrchestratorClient] = _state["client"]
             if client is None:
                 return history, logs, _render_tasks(lang)
@@ -614,7 +709,7 @@ def build_ui() -> gr.Blocks:
             return history, base, _render_tasks(lang)
 
         timer.tick(
-            _poll, [lang_state, chatbot, logs_out],
+            _poll, [chatbot, logs_out],
             [chatbot, logs_out, tasks_html])
 
         return demo
@@ -631,13 +726,22 @@ def launch(host: str = "127.0.0.1",
     ui = build_ui()
     launch_kwargs = dict(
         server_name=host, server_port=port,
-        inbrowser=inbrowser, share=share,
+        inbrowser=False, share=share,
     )
     if _IS_GRADIO6:
         launch_kwargs["css"] = _GLOBAL_CSS
         launch_kwargs["head"] = _HEAD_DARK
     launch_kwargs.update(kwargs)
+    if "inbrowser" in kwargs:
+        launch_kwargs["inbrowser"] = False
     ui.launch(**launch_kwargs)
+
+    if inbrowser:
+        try:
+            import webbrowser
+            webbrowser.open(f"http://{host}:{port}/")
+        except Exception:
+            pass
 
 
 def main(argv: Optional[List[str]] = None) -> None:
