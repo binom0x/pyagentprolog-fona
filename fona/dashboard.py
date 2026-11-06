@@ -1,25 +1,23 @@
 """Fona Dashboard — manage and monitor background agents.
 
 Features:
+  * project = folder: create/open a project folder that holds
+    team.json, scripts/ (agent copies) and logs/ (runtime)
   * add/remove agents (file picker, drag-drop, or manual path)
   * start/stop/restart, change port with live validation
   * live status cards: uptime, latency, rules, actions, sparkline
-  * team save/load (JSON); per-agent `autostart` flag decides who
-    starts when the team is loaded via "Load and start"
+  * per-agent `autostart` flag decides who starts on "Load and start"
+  * source tracking: every copied agent remembers its origin
+    (path + sha256 + mtime); the card shows a badge when the
+    source changed or disappeared, and a single click updates
+    the copy and restarts the agent (deliberate action)
   * action log of all dashboard operations
   * i18n: English / Russian switchable at runtime
-  * Language is auto-detected at startup:
-    - FONA_DASHBOARD_LANG  override (en / ru)
-    - locale.getlocale()
-    - LANG / LC_ALL / LANGUAGE / LC_MESSAGES
-    - GetUserDefaultUILanguage() on Windows
-    - fallback: en
-  * stdout/stderr are written to logs/<agent_id>.{out,err}.log
+  * stdout/stderr are written to <project>/logs/<agent_id>.{out,err}.log
   * on crash, the real stderr tail is shown in the card (no hiding)
   * the actual uvicorn port is auto-detected from the child's stdout
-    and the card self-corrects if the script hardcodes a different port
-  * children are tracked in logs/children.json; orphans from a previous
-    dashboard run are killed automatically on startup; a graceful
+  * children are tracked in <project>/logs/children.json; orphans from
+    a previous dashboard run are killed on project open; a graceful
     shutdown (Ctrl+C) kills the ones we started
 
 Run:
@@ -31,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import hashlib
 import json as _json
 import locale as _locale
 import os
@@ -39,6 +38,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time as _t
 import uuid
@@ -60,9 +60,18 @@ TRANSLATIONS = {
     "en": {
         "title": "Fona Dashboard",
         "agents": "Agents", "summary": "Summary",
+        "project": "Project",
+        "project_path_placeholder": "/path/to/my-team",
+        "project_name_placeholder": "team name (optional)",
+        "project_create": "Create",
+        "project_open": "Open",
+        "project_created": "Project created",
+        "project_opened": "Project opened",
+        "project_path_required": "Project folder is required",
+        "no_project": "No project open. Create or open one first.",
+        "no_project_active": "No active project",
         "add_agent": "Add Agent", "action_log": "Action Log",
         "team": "Team", "script": "Script",
-        "script_placeholder": "examples/demo_agent.py",
         "select_script": "Script file (drag or click)",
         "manual_path": "or paste absolute path",
         "port": "Port", "port_placeholder": "8000",
@@ -70,20 +79,21 @@ TRANSLATIONS = {
         "orch_port_optional": "Orchestrator port (opt)",
         "orch_port_placeholder": "8010",
         "add": "Add",
-        "start": "Start", "stop": "Stop", "restart": "Restart", "remove": "Remove",
+        "start": "Start", "stop": "Stop", "restart": "Restart",
+        "remove": "Remove",
         "open_ui": "Open UI", "open_orchestrator": "Orchestrator",
         "uptime": "uptime", "latency": "latency", "rules": "rules",
         "actions": "actions", "availability": "availability", "kb": "KB",
         "error": "error", "autostart": "autostart",
         "online": "ONLINE", "offline": "OFFLINE",
-        "starting": "STARTING", "stopped": "STOPPED", "error_status": "ERROR",
-        "save_load": "Save / Load", "saved_teams": "Saved teams",
-        "team_name": "New team name (no extension)",
-        "save_as": "Save as", "load": "Load",
-        "load_and_start": "Load and start", "delete": "Delete",
-        "load_hint": ("Load registers agents only. "
-                      "Load and start also launches agents whose "
-                      "per-card autostart flag is checked."),
+        "starting": "STARTING", "stopped": "STOPPED",
+        "error_status": "ERROR",
+        "save": "Save", "load": "Load",
+        "load_and_start": "Load and start",
+        "load_hint_v2": (
+            "Save writes team.json into the project folder. "
+            "Load re-reads it. Load and start also launches agents "
+            "whose per-card autostart flag is checked."),
         "empty_state": "No agents. Add a script in the panel on the left.",
         "empty_hint": "Example: examples/demo_agent.py, port 8000",
         "change_port_prompt": "New port for {name} (current {current}):",
@@ -93,9 +103,18 @@ TRANSLATIONS = {
         "port_busy": "Port {port} is already in use by another process",
         "port_invalid": "Port must be 1..65535",
         "script_missing": "Script not found: {path}",
-        "script_copied": "Script copied to agents/ folder",
         "no_script": "No script provided",
         "logs": "Logs",
+        "script_copied": "Copied to project scripts/",
+        "script_copied_renamed":
+            "Copied as new file (different content, old kept)",
+        "script_already_copied":
+            "Already in project (identical content, not duplicated)",
+        "using_source_in_place":
+            "Using file in place (no copy)",
+        "source_changed": "source changed",
+        "source_missing": "source missing",
+        "source_update": "Update",
         "status_total": "total", "status_online": "online",
         "status_offline": "offline", "status_stopped": "stopped",
         "status_starting": "starting",
@@ -109,19 +128,31 @@ TRANSLATIONS = {
         "log_restarted": "Restarted {name}",
         "log_removed": "Removed {name}",
         "log_port_changed": "Changed port of {name} to {port}",
-        "log_team_saved": "Saved team {name}",
-        "log_team_loaded": "Loaded team {name} (+{n})",
-        "log_team_loaded_started": ("Loaded team {name} (+{n}); "
+        "log_team_saved": "Saved team to {path}",
+        "log_team_loaded": "Loaded team from {path} (+{n})",
+        "log_team_loaded_started": ("Loaded team from {path} (+{n}); "
                                     "started {started} flagged agent(s)"),
-        "log_team_deleted": "Deleted team {name}",
+        "log_project_created": "Created project at {path}",
+        "log_project_opened": "Opened project at {path} (+{n})",
+        "log_script_missing": "Script missing for {name}: {path}",
+        "log_source_updated": "Updated {name} from {path}",
         "log_killed_stale": "Killed stale python process {pid} on port {port}",
     },
     "ru": {
         "title": "Дашборд Fona",
         "agents": "Агенты", "summary": "Сводка",
+        "project": "Проект",
+        "project_path_placeholder": "/путь/к/команде",
+        "project_name_placeholder": "имя команды (опционально)",
+        "project_create": "Создать",
+        "project_open": "Открыть",
+        "project_created": "Проект создан",
+        "project_opened": "Проект открыт",
+        "project_path_required": "Укажите папку проекта",
+        "no_project": "Проект не открыт. Создайте или откройте его.",
+        "no_project_active": "Проект не открыт",
         "add_agent": "Добавить агента", "action_log": "Журнал действий",
         "team": "Команда", "script": "Скрипт",
-        "script_placeholder": "examples/demo_agent.py",
         "select_script": "Файл скрипта (перетащите или нажмите)",
         "manual_path": "или вставьте абсолютный путь",
         "port": "Порт", "port_placeholder": "8000",
@@ -136,15 +167,14 @@ TRANSLATIONS = {
         "actions": "действий", "availability": "доступность", "kb": "БЗ",
         "error": "ошибка", "autostart": "автозапуск",
         "online": "ОНЛАЙН", "offline": "ОФЛАЙН",
-        "starting": "СТАРТ", "stopped": "СТОП", "error_status": "ОШИБКА",
-        "save_load": "Сохранить / Загрузить",
-        "saved_teams": "Сохранённые команды",
-        "team_name": "Имя новой команды (без расширения)",
-        "save_as": "Сохранить как", "load": "Загрузить",
-        "load_and_start": "Загрузить и запустить", "delete": "Удалить",
-        "load_hint": ("«Загрузить» только регистрирует агентов. "
-                      "«Загрузить и запустить» дополнительно запускает "
-                      "тех, у кого на карточке отмечен флаг autostart."),
+        "starting": "СТАРТ", "stopped": "СТОП",
+        "error_status": "ОШИБКА",
+        "save": "Сохранить", "load": "Загрузить",
+        "load_and_start": "Загрузить и запустить",
+        "load_hint_v2": (
+            "«Сохранить» пишет team.json в папку проекта. "
+            "«Загрузить» перечитывает его. «Загрузить и запустить» "
+            "дополнительно запускает агентов с флагом autostart."),
         "empty_state": "Нет агентов. Добавьте скрипт в панели слева.",
         "empty_hint": "Пример: examples/demo_agent.py, порт 8000",
         "change_port_prompt": "Новый порт для {name} (текущий {current}):",
@@ -154,9 +184,18 @@ TRANSLATIONS = {
         "port_busy": "Порт {port} занят другим процессом на этой машине",
         "port_invalid": "Порт должен быть 1..65535",
         "script_missing": "Скрипт не найден: {path}",
-        "script_copied": "Скрипт скопирован в папку agents/",
         "no_script": "Скрипт не указан",
         "logs": "Логи",
+        "script_copied": "Скопирован в scripts/ проекта",
+        "script_copied_renamed":
+            "Скопирован как новый файл (содержимое отличается, старый сохранён)",
+        "script_already_copied":
+            "Уже в проекте (идентичное содержимое, дубликат не создан)",
+        "using_source_in_place":
+            "Используется по месту (без копирования)",
+        "source_changed": "исходник изменён",
+        "source_missing": "исходник недоступен",
+        "source_update": "Обновить",
         "status_total": "всего", "status_online": "онлайн",
         "status_offline": "офлайн", "status_stopped": "остановлен",
         "status_starting": "стартует",
@@ -170,11 +209,14 @@ TRANSLATIONS = {
         "log_restarted": "Перезапущен {name}",
         "log_removed": "Удалён {name}",
         "log_port_changed": "Изменён порт {name} на {port}",
-        "log_team_saved": "Сохранена команда {name}",
-        "log_team_loaded": "Загружена команда {name} (+{n})",
-        "log_team_loaded_started": ("Загружена команда {name} (+{n}); "
+        "log_team_saved": "Команда сохранена в {path}",
+        "log_team_loaded": "Команда загружена из {path} (+{n})",
+        "log_team_loaded_started": ("Команда загружена из {path} (+{n}); "
                                     "запущено {started} агентов с флагом"),
-        "log_team_deleted": "Удалена команда {name}",
+        "log_project_created": "Создан проект в {path}",
+        "log_project_opened": "Открыт проект в {path} (+{n})",
+        "log_script_missing": "Скрипт не найден для {name}: {path}",
+        "log_source_updated": "Обновлён {name} из {path}",
         "log_killed_stale": "Убит устаревший python-процесс {pid} на порту {port}",
     },
 }
@@ -413,10 +455,11 @@ pre.status-box {
 .badge { font-size: 10px; padding: 2px 8px; border-radius: 10px;
          font-weight: 600; letter-spacing: .3px; text-transform: uppercase; }
 .badge.online   { background: #0f2a1a; color: #7ee787; }
-.badge.offline  { background: #2a0f12; color: #ff7b72; }
+.badge.offline  { background: #0f2a1a; color: #ff7b72; }
 .badge.starting { background: #2a1f0f; color: #e3b341; }
 .badge.stopped  { background: #21262d; color: #8b949e; }
 .badge.error    { background: #2a0f12; color: #ff7b72; }
+.badge.source-warn { background: #2a1f0f; color: #e3b341; }
 .card-body { display: flex; flex-direction: column; gap: 4px;
              font-size: 12px; color: #c7cbd1; }
 .kv { display: flex; justify-content: space-between; gap: 8px; }
@@ -441,6 +484,12 @@ pre.status-box {
     border-radius: 4px; font-size: 11px; border: 1px solid #2a313d;
 }
 .card-actions .logs-btn:hover { background: #30363d; }
+.card-actions .update-btn {
+    text-decoration: none !important; display: inline-block;
+    padding: 3px 8px; background: #2a1f0f; color: #e3b341 !important;
+    border-radius: 4px; font-size: 11px; border: 1px solid #3a2a10;
+}
+.card-actions .update-btn:hover { background: #3a2a10; }
 .empty-state { padding: 40px 20px; text-align: center; color: #8b949e;
     border: 1px dashed #2a313d; border-radius: 8px; font-size: 13px; }
 .sparkline { width: 100%; height: 30px; margin-top: 4px; }
@@ -542,16 +591,56 @@ def _get_action_log(lang: str) -> str:
 
 
 # ============================================================================
-# Log files for subprocess stdout/stderr
+# Project (folder = team)
 # ============================================================================
-_UVICORN_PORT_RE = re.compile(
-    r"Uvicorn running on https?://[^\s]+?:(\d+)"
-)
+@dataclass
+class Project:
+    """A project folder: team.json + scripts/ + logs/."""
+    root: str
+    name: str
+
+    @property
+    def team_file(self) -> str:
+        return os.path.join(self.root, "team.json")
+
+    @property
+    def scripts_dir(self) -> str:
+        return os.path.join(self.root, "scripts")
+
+    @property
+    def logs_dir(self) -> str:
+        return os.path.join(self.root, "logs")
+
+    def ensure(self) -> None:
+        for d in (self.root, self.scripts_dir, self.logs_dir):
+            os.makedirs(d, exist_ok=True)
+
+    @classmethod
+    def create(cls, root: str, name: str = "") -> "Project":
+        root = os.path.abspath(root)
+        p = cls(root=root, name=name or os.path.basename(root))
+        p.ensure()
+        return p
+
+    @classmethod
+    def open(cls, root: str) -> "Project":
+        root = os.path.abspath(root)
+        if not os.path.isfile(os.path.join(root, "team.json")):
+            raise FileNotFoundError(f"team.json not found in {root}")
+        p = cls(root=root, name=os.path.basename(root))
+        p.ensure()
+        return p
+
+
+_active_project: Optional[Project] = None
 
 
 def _logs_dir() -> str:
-    here = os.path.dirname(os.path.abspath(__file__))
-    path = os.path.join(here, "logs")
+    if _active_project is not None:
+        path = _active_project.logs_dir
+    else:
+        here = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(here, "logs")
     os.makedirs(path, exist_ok=True)
     return path
 
@@ -581,6 +670,11 @@ def _read_both_logs(agent_id: str, n: int = 500) -> Tuple[str, str]:
         _read_tail(_out_log_path(agent_id), n),
         _read_tail(_err_log_path(agent_id), n),
     )
+
+
+_UVICORN_PORT_RE = re.compile(
+    r"Uvicorn running on https?://[^\s]+?:(\d+)"
+)
 
 
 def _detect_uvicorn_port_from_logs(agent_id: str) -> Optional[int]:
@@ -787,7 +881,6 @@ def _kill_orphan_children() -> List[int]:
 # Port detection helpers
 # ============================================================================
 def _is_port_free(port: int) -> bool:
-    """True if we could bind to 127.0.0.1:port."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         if sys.platform != "win32":
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -831,12 +924,6 @@ class AgentEntry:
     status: str = "stopped"
     error: str = ""
     started_at: float = 0.0
-    # Time the poll loop first observed the agent in the "starting"
-    # state. The "no response > N s" timeout is measured from this
-    # moment, NOT from started_at (spawn time). Otherwise a slow
-    # sequential "Load and start" of many agents makes the first
-    # agents hit the timeout before poll() has even had a chance to
-    # check them.
     first_poll_starting_at: float = 0.0
     rules: int = 0
     actions: int = 0
@@ -845,6 +932,10 @@ class AgentEntry:
     latency_ms: float = 0.0
     history: List[int] = field(default_factory=list)
     autostart: bool = False
+    # source tracking (only set when the script was copied)
+    source: str = ""
+    source_sha256: str = ""
+    source_mtime: float = 0.0
 
     def __post_init__(self):
         if not self.url:
@@ -866,26 +957,54 @@ def _status_html(s: str) -> str:
     return f'<pre class="status-box">{_esc(str(s))}</pre>'
 
 
-def _agents_dir() -> str:
-    here = os.path.dirname(os.path.abspath(__file__))
-    path = os.path.join(here, "agents")
-    os.makedirs(path, exist_ok=True)
-    return path
+def _sha256(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
-def _install_script(src_path: str) -> str:
+def _install_script(src_path: str) -> Tuple[str, str]:
+    """Copy src_path into <project>/scripts/.
+
+    Returns (dest, status) where status is one of:
+      'same'    — identical content already present, no copy
+      'copied'  — copied under the same basename
+      'renamed' — copied as <stem>_<sha8>.py (different content, old kept)
+    """
     dest_dir = _agents_dir()
     basename = os.path.basename(src_path)
+    stem, ext = os.path.splitext(basename)
+    src_abs = os.path.abspath(src_path)
     dest = os.path.join(dest_dir, basename)
-    counter = 1
-    while (os.path.exists(dest)
-           and os.path.abspath(src_path) != os.path.abspath(dest)):
-        stem, ext = os.path.splitext(basename)
-        dest = os.path.join(dest_dir, f"{stem}_{counter}{ext}")
-        counter += 1
-    if os.path.abspath(src_path) != os.path.abspath(dest):
-        shutil.copy2(src_path, dest)
-    return dest
+
+    if os.path.abspath(dest) == src_abs:
+        return dest, "same"
+
+    if os.path.exists(dest):
+        try:
+            if _sha256(src_abs) == _sha256(dest):
+                return dest, "same"
+        except OSError:
+            pass
+        short = _sha256(src_abs)[:8]
+        dest = os.path.join(dest_dir, f"{stem}_{short}{ext}")
+
+    shutil.copy2(src_abs, dest)
+    return dest, ("copied" if dest == os.path.join(dest_dir, basename)
+                  else "renamed")
+
+
+def _agents_dir() -> str:
+    """Where uploaded/copied agent scripts live."""
+    if _active_project is not None:
+        path = _active_project.scripts_dir
+    else:
+        here = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(here, "agents")
+    os.makedirs(path, exist_ok=True)
+    return path
 
 
 def _file_to_path(f) -> Optional[str]:
@@ -921,6 +1040,41 @@ def _pick_script_dialog() -> str:
         return ""
 
 
+def _pick_directory_dialog() -> str:
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception:
+        return ""
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            root.attributes("-topmost", True)
+        except Exception:
+            pass
+        path = filedialog.askdirectory(title="Select project folder")
+        root.destroy()
+        return path or ""
+    except Exception:
+        return ""
+
+
+def _source_status(a: AgentEntry) -> str:
+    """Return '' if source is fine, else 'changed' or 'missing'."""
+    if not a.source:
+        return ""
+    if not os.path.isfile(a.source):
+        return "missing"
+    if not a.source_sha256:
+        return ""
+    try:
+        cur = _sha256(a.source)
+    except OSError:
+        return "missing"
+    return "" if cur == a.source_sha256 else "changed"
+
+
 # ============================================================================
 # Agent manager
 # ============================================================================
@@ -934,7 +1088,7 @@ class AgentManager:
         if not (1 <= int(port) <= 65535):
             raise ValueError(f"port must be 1..65535 (got {port})")
         if orch_port is not None and not (1 <= int(orch_port) <= 65535):
-            raise ValueError(f"orchestrator port must be 1..65535")
+            raise ValueError("orchestrator port must be 1..65535")
         with self._lock:
             for a in self.agents.values():
                 if a.port == int(port):
@@ -942,7 +1096,8 @@ class AgentManager:
                 if (orch_port is not None
                         and a.orchestrator_gradio_port == int(orch_port)):
                     raise ValueError(
-                        f"orchestrator port {orch_port} already used by {a.name}")
+                        f"orchestrator port {orch_port} already used by "
+                        f"{a.name}")
             if _is_port_open(int(port)):
                 raise ValueError(f"port {port} is in use")
             entry = AgentEntry(
@@ -1230,14 +1385,10 @@ class AgentManager:
         if a is None:
             return None
 
-        # ---- Direct child exited ----
         if a.process is not None and a.process.poll() is not None:
             rc = a.process.returncode
             a.process = None
 
-            # Give the port a moment: uvicorn may be delegated to a
-            # worker, or a healthy orphan may already be serving.
-            # Retry health for up to ~2s before flagging an error.
             deadline = _t.time() + 2.0
             while _t.time() < deadline:
                 if _health_ok(a.url, timeout=0.5):
@@ -1274,9 +1425,7 @@ class AgentManager:
                 a.history.append(0)
                 a.history = a.history[-40:]
                 return a
-            # rc == 0: fall through to normal health path.
 
-        # ---- Health check ----
         t0 = _t.time()
         ok = _health_ok(a.url, timeout=1.0)
         a.latency_ms = (_t.time() - t0) * 1000.0
@@ -1314,17 +1463,11 @@ class AgentManager:
                 a.status = "offline"
                 a.first_poll_starting_at = 0.0
             elif a.status == "starting":
-                # Timeout counts from the first poll that saw this
-                # agent in "starting", NOT from spawn time. This makes
-                # sequential "Load and start" of many agents immune
-                # to the first agents hitting the timeout before
-                # poll() has had a chance to check them.
                 if a.first_poll_starting_at == 0.0:
                     a.first_poll_starting_at = _t.time()
                 elapsed = _t.time() - a.first_poll_starting_at
                 if elapsed > 25.0:
                     a.status = "error"
-                    # Diagnostics: child alive? listener present?
                     child_alive = (a.process is not None
                                    and a.process.poll() is None)
                     listener_pid = _find_pid_by_port(a.port) or 0
@@ -1351,47 +1494,42 @@ _manager = AgentManager()
 
 
 # ============================================================================
-# Team save/load
+# Team save/load (project-aware, version 2)
 # ============================================================================
-TEAM_VERSION = 1
-TEAM_DIR = "teams"
-
-
-def _teams_dir() -> str:
-    here = os.path.dirname(os.path.abspath(__file__))
-    path = os.path.join(here, TEAM_DIR)
-    os.makedirs(path, exist_ok=True)
-    return path
-
-
-def _team_path(name: str) -> str:
-    safe = re.sub(r"[^a-zA-Z0-9_\-]+", "_", (name or "").strip())
-    safe = safe.strip("_") or str(uuid.uuid4())[:8]
-    return os.path.join(_teams_dir(), f"{safe}.json")
-
-
-def _list_teams() -> List[str]:
-    d = _teams_dir()
-    return sorted(os.path.splitext(f)[0]
-                  for f in os.listdir(d) if f.endswith(".json"))
+TEAM_VERSION = 2
 
 
 def _agent_to_dict(a: AgentEntry, base_dir: str) -> dict:
-    try:
-        rel = os.path.relpath(a.script, base_dir)
-    except ValueError:
-        rel = a.script
-    return {
-        "id": a.id, "name": a.name, "script": rel,
+    def rel(p: str) -> str:
+        if not p:
+            return ""
+        try:
+            return os.path.relpath(p, base_dir)
+        except ValueError:
+            return p
+
+    d = {
+        "id": a.id, "name": a.name,
+        "script": rel(a.script),
         "port": a.port, "autostart": a.autostart,
         "orchestrator_gradio_port": a.orchestrator_gradio_port,
     }
+    if a.source:
+        d["source"] = rel(a.source)
+        d["source_sha256"] = a.source_sha256
+        d["source_mtime"] = a.source_mtime
+    return d
 
 
 def _dict_to_agent(d: dict, base_dir: str) -> AgentEntry:
-    script = d.get("script", "")
-    if script and not os.path.isabs(script):
-        script = os.path.normpath(os.path.join(base_dir, script))
+    def abspath_or_rel(p: str) -> str:
+        if not p:
+            return p
+        return p if os.path.isabs(p) else os.path.normpath(
+            os.path.join(base_dir, p))
+
+    script = abspath_or_rel(d.get("script", ""))
+    source = abspath_or_rel(d.get("source", "")) if d.get("source") else ""
     return AgentEntry(
         id=d.get("id") or str(uuid.uuid4())[:8],
         name=d.get("name") or Path(script).stem,
@@ -1400,32 +1538,38 @@ def _dict_to_agent(d: dict, base_dir: str) -> AgentEntry:
         orchestrator_gradio_port=(
             int(d["orchestrator_gradio_port"])
             if d.get("orchestrator_gradio_port") else None),
+        source=source,
+        source_sha256=d.get("source_sha256", ""),
+        source_mtime=float(d.get("source_mtime") or 0.0),
     )
 
 
-def save_team(name: str) -> str:
-    path = _team_path(name)
-    base_dir = os.path.dirname(path)
+def save_team(_unused_name: str = "") -> str:
+    if _active_project is None:
+        raise RuntimeError("no active project")
+    project = _active_project
+    project.ensure()
     payload = {
         "version": TEAM_VERSION,
-        "name": name or os.path.basename(path),
+        "name": project.name,
         "saved_at": _dt.datetime.now().isoformat(timespec="seconds"),
-        "agents": [_agent_to_dict(a, base_dir) for a in _manager.list()],
+        "agents": [_agent_to_dict(a, project.root)
+                   for a in _manager.list()],
     }
-    with open(path, "w", encoding="utf-8") as f:
+    with open(project.team_file, "w", encoding="utf-8") as f:
         _json.dump(payload, f, indent=2, ensure_ascii=False)
-    return path
+    return project.team_file
 
 
-def load_team(name: str, *, start_flagged: bool = False) -> Tuple[int, int]:
-    path = _team_path(name)
+def load_team(path: str, *, start_flagged: bool = False
+              ) -> Tuple[int, int]:
     if not os.path.isfile(path):
         raise FileNotFoundError(path)
     with open(path, "r", encoding="utf-8") as f:
         payload = _json.load(f)
-    if payload.get("version") != TEAM_VERSION:
-        raise ValueError(
-            f"unsupported team version: {payload.get('version')}")
+    version = payload.get("version")
+    if version not in (1, 2):
+        raise ValueError(f"unsupported team version: {version}")
 
     base_dir = os.path.dirname(path)
     loaded = 0
@@ -1437,13 +1581,22 @@ def load_team(name: str, *, start_flagged: bool = False) -> Tuple[int, int]:
                 entry = _dict_to_agent(d, base_dir)
             except Exception:
                 continue
+            if not os.path.isfile(entry.script):
+                _log_action("log_script_missing",
+                            name=entry.name, path=entry.script)
+                continue
             existing = _manager.agents.get(entry.id)
             if existing is not None:
                 existing.name = entry.name
                 existing.script = entry.script
+                existing.source = entry.source
+                existing.source_sha256 = entry.source_sha256
+                existing.source_mtime = entry.source_mtime
                 existing.autostart = entry.autostart
-                existing.orchestrator_gradio_port = entry.orchestrator_gradio_port
-                if existing.port != entry.port and _is_port_free(entry.port):
+                existing.orchestrator_gradio_port = \
+                    entry.orchestrator_gradio_port
+                if (existing.port != entry.port
+                        and _is_port_free(entry.port)):
                     if existing.is_alive():
                         _manager._stop_process(existing)
                     existing.port = entry.port
@@ -1497,6 +1650,23 @@ def _sparkline(history: List[int]) -> str:
     )
 
 
+def _source_badge(a: AgentEntry, lang: str) -> str:
+    st = _source_status(a)
+    if not st:
+        return ""
+    label = t(lang, "source_changed" if st == "changed"
+              else "source_missing")
+    if st == "changed":
+        # clickable: update from source and restart
+        return (
+            f'<a class="update-btn" '
+            f'href="javascript:dashAction('
+            f"'/dashboard/update_source?id={a.id}')"
+            f'" title="{_esc(label)}">\u26a0 {_esc(label)}</a>'
+        )
+    return f'<span class="badge source-warn">\u26a0 {_esc(label)}</span>'
+
+
 def _card_html(a: AgentEntry, lang: str) -> str:
     status_key = {
         "online": "online", "offline": "offline",
@@ -1535,6 +1705,26 @@ def _card_html(a: AgentEntry, lang: str) -> str:
         f'<span class="v">{_esc(a.kb_file)}</span></div>'
         if a.kb_file else ""
     )
+    source_html = ""
+    if a.source:
+        src_status = _source_status(a)
+        src_name = os.path.basename(a.source)
+        src_extra = (f' <span class="badge source-warn">'
+                     f'{_esc(t(lang, "source_changed" if src_status == "changed"
+                               else "source_missing"))}</span>'
+                     if src_status else "")
+        update_link = (
+            f' <a class="update-btn" '
+            f'href="javascript:dashAction('
+            f"'/dashboard/update_source?id={a.id}')"
+            f'">{t(lang, "source_update")}</a>'
+            if src_status == "changed" else ""
+        )
+        source_html = (
+            f'<div class="kv"><span class="k">source</span>'
+            f'<span class="v" title="{_esc(a.source)}">'
+            f'{_esc(src_name)}{src_extra}{update_link}</span></div>'
+        )
     ratio = (f"{sum(a.history[-20:])}/{len(a.history[-20:])}"
              if a.history else "\u2014")
     autostart_checked = "checked" if a.autostart else ""
@@ -1561,6 +1751,7 @@ def _card_html(a: AgentEntry, lang: str) -> str:
     <div class="kv"><span class="k">{t(lang, "actions")}</span>
       <span class="v">{a.actions}</span></div>
     {kb_html}
+    {source_html}
     <div class="kv"><span class="k">{t(lang, "availability")}</span>
       <span class="v">{ratio}</span></div>
     {error_html}
@@ -1663,6 +1854,65 @@ def _status_dict(lang: str) -> dict:
 # ============================================================================
 def _attach_dashboard_routes(app):
 
+    # ---------------- Project ----------------
+    @app.get("/dashboard/project")
+    async def dash_project_get():
+        if _active_project is None:
+            return {"active": False}
+        return {
+            "active": True,
+            "root": _active_project.root,
+            "name": _active_project.name,
+            "team_file": _active_project.team_file,
+            "agents_count": len(_manager.list()),
+        }
+
+    @app.post("/dashboard/project/create")
+    async def dash_project_create(request: Request):
+        body = await request.json()
+        root = (body.get("root") or "").strip()
+        name = (body.get("name") or "").strip()
+        if not root:
+            return {"status": "error", "error": "root is required"}
+        try:
+            global _active_project
+            _manager.stop_all()
+            _manager.agents.clear()
+            _active_project = Project.create(root, name)
+            _log_action("log_project_created", path=_active_project.root)
+            return {"status": "ok", "root": _active_project.root,
+                    "name": _active_project.name}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+    @app.post("/dashboard/project/open")
+    async def dash_project_open(request: Request):
+        body = await request.json()
+        root = (body.get("root") or "").strip()
+        try:
+            global _active_project
+            project = Project.open(root)
+            _manager.stop_all()
+            _manager.agents.clear()
+            _active_project = project
+            _kill_orphan_children()
+            loaded, _ = load_team(project.team_file, start_flagged=False)
+            _log_action("log_project_opened",
+                        path=project.root, n=loaded)
+            return {"status": "ok", "root": project.root,
+                    "name": project.name, "loaded": loaded}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+    @app.post("/dashboard/project/close")
+    async def dash_project_close():
+        global _active_project
+        _manager.stop_all()
+        _manager.agents.clear()
+        _active_project = None
+        return {"status": "ok"}
+
+    # ---------------- Agent lifecycle ----------------
     @app.post("/dashboard/start")
     async def dash_start(request: Request):
         aid = request.query_params.get("id")
@@ -1721,6 +1971,29 @@ def _attach_dashboard_routes(app):
         _manager.set_autostart(request.query_params.get("id"), val)
         return {"status": "ok"}
 
+    # ---------------- Source update ----------------
+    @app.post("/dashboard/update_source")
+    async def dash_update_source(request: Request):
+        aid = request.query_params.get("id")
+        a = _manager.get(aid)
+        if a is None or not a.source:
+            return {"status": "error", "error": "no source"}
+        if not os.path.isfile(a.source):
+            return {"status": "error", "error": "source missing"}
+        try:
+            dest, status = _install_script(a.source)
+            a.script = dest
+            a.source_sha256 = _sha256(a.source)
+            a.source_mtime = os.path.getmtime(a.source)
+            if a.status in ("online", "starting"):
+                _manager.restart(aid)
+            _log_action("log_source_updated", name=a.name, path=dest)
+            return {"status": "ok", "script": dest,
+                    "sha": a.source_sha256, "copy_status": status}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+    # ---------------- Logs / env / project info ----------------
     @app.get("/dashboard/logs")
     async def dash_logs(id: str, kind: str = "err", tail: int = 20000):
         path = _out_log_path(id) if kind == "out" else _err_log_path(id)
@@ -1737,25 +2010,26 @@ def _attach_dashboard_routes(app):
             "python_paths": _python_paths(),
             "pythonpath": os.environ.get("PYTHONPATH", ""),
             "logs_dir": _logs_dir(),
-            "agents_dir": _agents_dir(),
-            "teams_dir": _teams_dir(),
+            "scripts_dir": _agents_dir(),
             "pid_file": _pid_file(),
             "children": _load_pid_map(),
             "web_concurrency": os.environ.get("WEB_CONCURRENCY"),
+            "project": (
+                {"root": _active_project.root,
+                 "name": _active_project.name,
+                 "team_file": _active_project.team_file}
+                if _active_project is not None else None),
         }
 
-    @app.get("/dashboard/teams")
-    async def dash_teams():
-        return {"teams": _list_teams()}
-
+    # ---------------- Save / load team ----------------
     @app.post("/dashboard/teams/save")
     async def dash_team_save(request: Request):
-        body = await request.json()
+        if _active_project is None:
+            return {"status": "error",
+                    "error": "no active project; create or open one first"}
         try:
-            name = body.get("name") or ""
-            path = save_team(name)
-            _log_action("log_team_saved",
-                        name=name or os.path.basename(path))
+            path = save_team("")
+            _log_action("log_team_saved", path=path)
             return {"status": "ok", "path": path}
         except Exception as e:
             return {"status": "error", "error": str(e)}
@@ -1763,32 +2037,22 @@ def _attach_dashboard_routes(app):
     @app.post("/dashboard/teams/load")
     async def dash_team_load(request: Request):
         body = await request.json()
+        if _active_project is None:
+            return {"status": "error",
+                    "error": "no active project; create or open one first"}
         try:
-            name = body.get("name") or ""
             start_flagged = bool(body.get(
                 "start_flagged", body.get("autostart", False)))
-            loaded, started = load_team(name, start_flagged=start_flagged)
+            path = _active_project.team_file
+            loaded, started = load_team(path, start_flagged=start_flagged)
             if start_flagged:
                 _log_action("log_team_loaded_started",
-                            name=name, n=loaded, started=started)
+                            path=path, n=loaded, started=started)
             else:
-                _log_action("log_team_loaded", name=name, n=loaded)
+                _log_action("log_team_loaded", path=path, n=loaded)
             return {"status": "ok",
                     "loaded": loaded,
                     "started": started}
-        except Exception as e:
-            return {"status": "error", "error": str(e)}
-
-    @app.post("/dashboard/teams/delete")
-    async def dash_team_delete(request: Request):
-        body = await request.json()
-        try:
-            name = body.get("name") or ""
-            path = _team_path(name)
-            if os.path.isfile(path):
-                os.remove(path)
-            _log_action("log_team_deleted", name=name)
-            return {"status": "ok"}
         except Exception as e:
             return {"status": "error", "error": str(e)}
 
@@ -1801,14 +2065,6 @@ def build_ui() -> gr.Blocks:
     print(f"[fona] dashboard language: {lang} "
           f"(override: FONA_DASHBOARD_LANG=en|ru)",
           file=sys.stderr, flush=True)
-    print(f"[fona] logs dir: {_logs_dir()}", file=sys.stderr, flush=True)
-    print(f"[fona] python paths for children: {_python_paths()}",
-          file=sys.stderr, flush=True)
-
-    killed = _kill_orphan_children()
-    if killed:
-        print(f"[fona] cleaned up {len(killed)} orphan child process(es)",
-              file=sys.stderr, flush=True)
 
     _blocks_kwargs = {"title": t(lang, "title")}
     if not _IS_GRADIO6:
@@ -1821,12 +2077,37 @@ def build_ui() -> gr.Blocks:
         with gr.Row(equal_height=False):
 
             with gr.Column(scale=2, min_width=340):
+                # ---------------- Project ----------------
                 gr.HTML(f'<div class="col-head">\U0001f4c1 '
-                        f'{t(lang, "team")}</div>')
+                        f'{t(lang, "project")}</div>')
+                with gr.Row(equal_height=True):
+                    project_path = gr.Textbox(
+                        placeholder=t(lang, "project_path_placeholder"),
+                        show_label=False, scale=4,
+                        elem_classes=["compact-tb"])
+                    project_browse = gr.Button(
+                        "\U0001f4c2", size="sm", scale=0, min_width=0,
+                        elem_classes=["compact-btn"])
+                with gr.Row(equal_height=True):
+                    project_name = gr.Textbox(
+                        placeholder=t(lang, "project_name_placeholder"),
+                        show_label=False, scale=2,
+                        elem_classes=["compact-tb"])
+                    project_create_btn = gr.Button(
+                        f"\u2795 {t(lang, 'project_create')}",
+                        size="sm", variant="primary", scale=1,
+                        elem_classes=["compact-btn"])
+                    project_open_btn = gr.Button(
+                        f"\U0001f4c2 {t(lang, 'project_open')}",
+                        size="sm", scale=1,
+                        elem_classes=["compact-btn"])
+                project_status = gr.HTML(
+                    _status_html(t(lang, "no_project_active")))
 
+                # ---------------- Add agent ----------------
                 with gr.Accordion(
                         f"\u2795 {t(lang, 'add_agent')}",
-                        open=True) as add_acc:
+                        open=True):
                     new_script_file = gr.File(
                         label=t(lang, "select_script"),
                         file_types=[".py"],
@@ -1862,45 +2143,26 @@ def build_ui() -> gr.Blocks:
                         elem_classes=["compact-btn"])
                     add_status = gr.HTML(_status_html(""))
 
-                with gr.Accordion(
-                        f"\U0001f4be {t(lang, 'save_load')}",
-                        open=False) as team_acc:
-                    team_dropdown = gr.Dropdown(
-                        choices=_list_teams(),
-                        label=t(lang, "saved_teams"),
-                        allow_custom_value=True,
-                        elem_classes=["compact-tb"])
-                    with gr.Row(equal_height=True):
-                        team_refresh = gr.Button(
-                            "\U0001f504", size="sm",
-                            scale=0, min_width=0,
-                            elem_classes=["compact-btn"])
-                        team_name_input = gr.Textbox(
-                            placeholder=t(lang, "team_name"),
-                            show_label=False, scale=4,
-                            elem_classes=["compact-tb"])
-                    with gr.Row(equal_height=True):
-                        team_save_btn = gr.Button(
-                            f"\U0001f4be {t(lang, 'save_as')}",
-                            size="sm", variant="primary", scale=1,
-                            elem_classes=["compact-btn"])
-                        team_delete_btn = gr.Button(
-                            f"\U0001f5d1 {t(lang, 'delete')}",
-                            size="sm", scale=1,
-                            elem_classes=["compact-btn"])
-                    with gr.Row(equal_height=True):
-                        team_load_btn = gr.Button(
-                            f"\U0001f4c2 {t(lang, 'load')}",
-                            size="sm", scale=1,
-                            elem_classes=["compact-btn"])
-                        team_load_start_btn = gr.Button(
-                            f"\u25b6 {t(lang, 'load_and_start')}",
-                            size="sm", variant="primary", scale=2,
-                            elem_classes=["compact-btn"])
-                    team_hint = gr.HTML(
-                        f'<div class="team-hint">'
-                        f'{t(lang, "load_hint")}</div>')
-                    team_status = gr.HTML(_status_html(""))
+                # ---------------- Team save/load ----------------
+                gr.HTML(f'<div class="col-head">\U0001f4be '
+                        f'{t(lang, "team")}</div>')
+                with gr.Row(equal_height=True):
+                    team_save_btn = gr.Button(
+                        f"\U0001f4be {t(lang, 'save')}",
+                        size="sm", variant="primary", scale=1,
+                        elem_classes=["compact-btn"])
+                    team_load_btn = gr.Button(
+                        f"\U0001f4c2 {t(lang, 'load')}",
+                        size="sm", scale=1,
+                        elem_classes=["compact-btn"])
+                    team_load_start_btn = gr.Button(
+                        f"\u25b6 {t(lang, 'load_and_start')}",
+                        size="sm", variant="primary", scale=2,
+                        elem_classes=["compact-btn"])
+                team_hint = gr.HTML(
+                    f'<div class="team-hint">'
+                    f'{t(lang, "load_hint_v2")}</div>')
+                team_status = gr.HTML(_status_html(""))
 
             with gr.Column(scale=5, min_width=520):
                 with gr.Row(equal_height=True):
@@ -1942,37 +2204,124 @@ def build_ui() -> gr.Blocks:
                           [cards_html, summary_json,
                            summary_chart, action_log])
 
+        # ---------------- Project handlers ----------------
+        project_browse.click(_pick_directory_dialog, [], [project_path])
+
+        def _on_project_create(lang_code, root, name):
+            try:
+                global _active_project
+                if not root:
+                    return _status_html(
+                        f"\u2717 {t(lang_code, 'project_path_required')}")
+                _manager.stop_all()
+                _manager.agents.clear()
+                _active_project = Project.create(root, name or "")
+                _log_action("log_project_created",
+                            path=_active_project.root)
+                return _status_html(
+                    f"\u2713 {t(lang_code, 'project_created')}: "
+                    f"{_active_project.root}")
+            except Exception as e:
+                return _status_html(f"\u2717 {e}")
+
+        project_create_btn.click(
+            _on_project_create, [lang_state, project_path, project_name],
+            [project_status]).then(
+            _refresh, [lang_state],
+            [cards_html, summary_json, summary_chart, action_log])
+
+        def _on_project_open(lang_code, root):
+            try:
+                global _active_project
+                if not root:
+                    return (_status_html(
+                        f"\u2717 {t(lang_code, 'project_path_required')}"),
+                        _render_cards(lang_code), _status_dict(lang_code),
+                        _get_action_log(lang_code))
+                project = Project.open(root)
+                _manager.stop_all()
+                _manager.agents.clear()
+                _active_project = project
+                _kill_orphan_children()
+                loaded, _ = load_team(project.team_file,
+                                      start_flagged=False)
+                _log_action("log_project_opened",
+                            path=project.root, n=loaded)
+                return (_status_html(
+                            f"\u2713 {t(lang_code, 'project_opened')}: "
+                            f"{project.root} (+{loaded})"),
+                        _render_cards(lang_code),
+                        _status_dict(lang_code),
+                        _get_action_log(lang_code))
+            except Exception as e:
+                return (_status_html(f"\u2717 {e}"),
+                        _render_cards(lang_code),
+                        _status_dict(lang_code),
+                        _get_action_log(lang_code))
+
+        project_open_btn.click(
+            _on_project_open, [lang_state, project_path],
+            [project_status, cards_html, summary_json, action_log])
+
+        # ---------------- Add agent handler ----------------
         new_script_browse.click(
             _pick_script_dialog, [], [new_script_manual])
 
         def _add(lang_code, file_obj, manual_path, port, orch_port, name):
             try:
+                if _active_project is None:
+                    return _status_html(
+                        f"\u2717 {t(lang_code, 'no_project')}")
                 script_path = None
+                source_path = ""
+                source_sha = ""
+                source_mtime = 0.0
                 notes: List[str] = []
+
                 manual = (manual_path or "").strip()
                 if manual and os.path.isfile(manual):
                     script_path = manual
-                if script_path is None:
+                    notes.append(t(lang_code, "using_source_in_place"))
+                else:
                     uploaded = _file_to_path(file_obj)
                     if uploaded and os.path.isfile(uploaded):
-                        import tempfile
-                        tmp = tempfile.gettempdir()
+                        tmp = os.path.abspath(tempfile.gettempdir())
                         is_temp = os.path.abspath(uploaded).startswith(
-                            os.path.abspath(tmp) + os.sep)
+                            tmp + os.sep)
                         if is_temp:
-                            script_path = _install_script(uploaded)
-                            notes.append(t(lang_code, "script_copied"))
+                            dest, status = _install_script(uploaded)
+                            script_path = dest
+                            source_path = uploaded
+                            source_sha = _sha256(uploaded)
+                            source_mtime = os.path.getmtime(uploaded)
+                            if status == "same":
+                                notes.append(
+                                    t(lang_code, "script_already_copied"))
+                            elif status == "renamed":
+                                notes.append(
+                                    t(lang_code, "script_copied_renamed"))
+                            else:
+                                notes.append(
+                                    t(lang_code, "script_copied"))
                         else:
                             script_path = uploaded
+                            notes.append(
+                                t(lang_code, "using_source_in_place"))
+
                 if script_path is None:
                     return _status_html(
                         f"\u2717 {t(lang_code, 'no_script')}")
+
                 entry = _manager.add(
                     script_path, name or "",
                     int(port) if port else 8000,
                     int(orch_port) if orch_port else None,
                 )
+                entry.source = source_path
+                entry.source_sha256 = source_sha
+                entry.source_mtime = source_mtime
                 _log_action("log_added", name=entry.name, url=entry.url)
+
                 msg = f"\u2713 {entry.name} \u2192 {entry.url}"
                 if notes:
                     msg += "\n  " + "\n  ".join(notes)
@@ -1990,45 +2339,43 @@ def build_ui() -> gr.Blocks:
             [cards_html, summary_json, summary_chart, action_log],
         )
 
-        def _refresh_teams():
-            names = _list_teams()
-            return gr.update(choices=names,
-                             value=names[0] if names else None)
-
-        team_refresh.click(_refresh_teams, [], [team_dropdown])
-
-        def _do_save(lang_code, name):
+        # ---------------- Team handlers ----------------
+        def _do_save(lang_code):
             try:
-                name = (name or "").strip()
-                path = save_team(name)
-                _log_action("log_team_saved",
-                            name=name or os.path.basename(path))
+                if _active_project is None:
+                    return (_status_html(
+                                f"\u2717 {t(lang_code, 'no_project')}"),
+                            _get_action_log(lang_code))
+                path = save_team("")
+                _log_action("log_team_saved", path=path)
                 return (_status_html(
-                    f"\u2713 {os.path.basename(path)}: "
-                    f"{len(_manager.list())} agents"),
-                    _refresh_teams(),
-                    _get_action_log(lang_code))
+                            f"\u2713 {os.path.basename(path)}: "
+                            f"{len(_manager.list())} agents"),
+                        _get_action_log(lang_code))
             except Exception as e:
                 return (_status_html(f"\u2717 {e}"),
-                        _refresh_teams(),
                         _get_action_log(lang_code))
 
-        team_save_btn.click(
-            _do_save, [lang_state, team_name_input],
-            [team_status, team_dropdown, action_log])
+        team_save_btn.click(_do_save, [lang_state],
+                            [team_status, action_log])
 
-        def _do_load(lang_code, name, start_flagged):
+        def _do_load(lang_code, start_flagged):
             try:
+                if _active_project is None:
+                    return (_status_html(
+                                f"\u2717 {t(lang_code, 'no_project')}"),
+                            _render_cards(lang_code),
+                            _status_dict(lang_code),
+                            _get_action_log(lang_code))
+                path = _active_project.team_file
                 loaded, started = load_team(
-                    name or "", start_flagged=bool(start_flagged))
+                    path, start_flagged=bool(start_flagged))
                 if start_flagged:
                     _log_action("log_team_loaded_started",
-                                name=name or "", n=loaded,
-                                started=started)
+                                path=path, n=loaded, started=started)
                 else:
-                    _log_action("log_team_loaded",
-                                name=name or "", n=loaded)
-                msg = f"\u2713 {name}: +{loaded}"
+                    _log_action("log_team_loaded", path=path, n=loaded)
+                msg = f"\u2713 +{loaded}"
                 if start_flagged:
                     msg += f", started {started}"
                 return (_status_html(msg),
@@ -2042,33 +2389,14 @@ def build_ui() -> gr.Blocks:
                         _get_action_log(lang_code))
 
         team_load_btn.click(
-            lambda lang_code, name: _do_load(lang_code, name, False),
-            [lang_state, team_dropdown],
+            lambda lang_code: _do_load(lang_code, False),
+            [lang_state],
             [team_status, cards_html, summary_json, action_log])
 
         team_load_start_btn.click(
-            lambda lang_code, name: _do_load(lang_code, name, True),
-            [lang_state, team_dropdown],
+            lambda lang_code: _do_load(lang_code, True),
+            [lang_state],
             [team_status, cards_html, summary_json, action_log])
-
-        def _do_delete(lang_code, name):
-            try:
-                name = (name or "").strip()
-                path = _team_path(name)
-                if os.path.isfile(path):
-                    os.remove(path)
-                _log_action("log_team_deleted", name=name)
-                return (_status_html(f"\u2713 {name}"),
-                        _refresh_teams(),
-                        _get_action_log(lang_code))
-            except Exception as e:
-                return (_status_html(f"\u2717 {e}"),
-                        _refresh_teams(),
-                        _get_action_log(lang_code))
-
-        team_delete_btn.click(
-            _do_delete, [lang_state, team_dropdown],
-            [team_status, team_dropdown, action_log])
 
         return demo
 
@@ -2095,7 +2423,8 @@ def launch(host: str = "127.0.0.1",
     if _IS_GRADIO6:
         head = _HEAD_DARK
         if favicon:
-            head += f'<link rel="icon" href="/favicon.ico?v={int(_t.time())}">'
+            head += (f'<link rel="icon" href="/favicon.ico'
+                     f'?v={int(_t.time())}">')
         launch_kwargs["css"] = _GLOBAL_CSS
         launch_kwargs["head"] = head
 
