@@ -2,9 +2,12 @@ README.md
 pyproject.toml
 fona/__init__.py
 fona/agent.py
-fona/app.py
+fona/config.py
 fona/dashboard.py
 fona/orchestrator_app.py
+fona/orchestrator_ui.py
+fona/peers.py
+fona/protocol.py
 fona/server.py
 fona/ui.py
 fona/assets/favicon.png

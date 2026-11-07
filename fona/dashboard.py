@@ -7,6 +7,9 @@ Features:
   * start/stop/restart, change port with live validation
   * live status cards: uptime, latency, rules, actions, sparkline
   * per-agent `autostart` flag decides who starts on "Load and start"
+  * per-agent `orchestrator_template` — path to a custom Gradio UI
+    module (e.g. examples/orchestrator_template.py); when set, the
+    "Orchestrator" button on the card launches it
   * source tracking: every copied agent remembers its origin
     (path + sha256 + mtime); the card shows a badge when the
     source changed or disappeared, and a single click updates
@@ -78,6 +81,11 @@ TRANSLATIONS = {
         "name_optional": "Name (optional)", "name_placeholder": "my-agent",
         "orch_port_optional": "Orchestrator port (opt)",
         "orch_port_placeholder": "8010",
+        "orch_template_optional": "Orchestrator UI template (opt)",
+        "orch_template_placeholder": "path/to/orchestrator_template.py",
+        "orch_template_missing":
+            "orchestrator template not found: {path}",
+        "orch_ui": "orch ui",
         "add": "Add",
         "start": "Start", "stop": "Stop", "restart": "Restart",
         "remove": "Remove",
@@ -137,6 +145,8 @@ TRANSLATIONS = {
         "log_script_missing": "Script missing for {name}: {path}",
         "log_source_updated": "Updated {name} from {path}",
         "log_killed_stale": "Killed stale python process {pid} on port {port}",
+        "log_orch_template_missing":
+            "Orchestrator template missing for {name}: {path}",
     },
     "ru": {
         "title": "Дашборд Fona",
@@ -159,6 +169,11 @@ TRANSLATIONS = {
         "name_optional": "Имя (опционально)", "name_placeholder": "мой-агент",
         "orch_port_optional": "Порт оркестратора (опц)",
         "orch_port_placeholder": "8010",
+        "orch_template_optional": "Шаблон UI оркестратора (опц)",
+        "orch_template_placeholder": "путь/к/orchestrator_template.py",
+        "orch_template_missing":
+            "шаблон оркестратора не найден: {path}",
+        "orch_ui": "UI оркестратора",
         "add": "Добавить",
         "start": "Старт", "stop": "Стоп", "restart": "Перезапустить",
         "remove": "Удалить",
@@ -218,6 +233,8 @@ TRANSLATIONS = {
         "log_script_missing": "Скрипт не найден для {name}: {path}",
         "log_source_updated": "Обновлён {name} из {path}",
         "log_killed_stale": "Убит устаревший python-процесс {pid} на порту {port}",
+        "log_orch_template_missing":
+            "Шаблон оркестратора не найден для {name}: {path}",
     },
 }
 
@@ -921,6 +938,7 @@ class AgentEntry:
     process: Optional[subprocess.Popen] = None
     orchestrator_gradio_port: Optional[int] = None
     orchestrator_process: Optional[subprocess.Popen] = None
+    orchestrator_template: Optional[str] = None
     status: str = "stopped"
     error: str = ""
     started_at: float = 0.0
@@ -1084,7 +1102,8 @@ class AgentManager:
         self._lock = threading.RLock()
 
     def add(self, script: str, name: str, port: int,
-            orch_port: Optional[int] = None) -> AgentEntry:
+            orch_port: Optional[int] = None,
+            orch_template: Optional[str] = None) -> AgentEntry:
         if not (1 <= int(port) <= 65535):
             raise ValueError(f"port must be 1..65535 (got {port})")
         if orch_port is not None and not (1 <= int(orch_port) <= 65535):
@@ -1106,6 +1125,7 @@ class AgentManager:
                 script=script, port=int(port),
                 orchestrator_gradio_port=(
                     int(orch_port) if orch_port else None),
+                orchestrator_template=orch_template or None,
             )
             self.agents[entry.id] = entry
             return entry
@@ -1156,6 +1176,12 @@ class AgentManager:
         a = self.get(agent_id)
         if a is not None:
             a.autostart = bool(value)
+
+    def set_orchestrator_template(self, agent_id: str,
+                                  path: Optional[str]) -> None:
+        a = self.get(agent_id)
+        if a is not None:
+            a.orchestrator_template = path or None
 
     def start(self, agent_id: str) -> None:
         a = self.get(agent_id)
@@ -1274,31 +1300,48 @@ class AgentManager:
             _log_action("log_start_failed", name=a.name, reason=a.error)
             return
 
+        # ---- 3. Orchestrator UI (optional) ----
         if a.orchestrator_gradio_port and a.orchestrator_process is None:
-            try:
-                okwargs = {}
-                if sys.platform == "win32":
-                    okwargs["creationflags"] = 0x08000000
-                o_out = open(
-                    os.path.join(_logs_dir(), f"{a.id}.orch.out.log"), "wb")
-                o_err = open(
-                    os.path.join(_logs_dir(), f"{a.id}.orch.err.log"), "wb")
-                try:
-                    a.orchestrator_process = subprocess.Popen(
-                        [exe, "-u", "-m", "fona.orchestrator_app",
-                         "--orchestrator", a.url,
-                         "--port", str(a.orchestrator_gradio_port),
-                         "--no-browser"],
-                        env={**os.environ, "FONA_CHILD": "1"},
-                        stdout=o_out, stderr=o_err, **okwargs,
-                    )
-                finally:
-                    o_out.close()
-                    o_err.close()
-            except Exception as e:
-                a.error = f"orchestrator spawn failed: {e}"
-                print(f"[fona] orchestrator spawn failed for {a.name}: {e}",
+            if (a.orchestrator_template
+                    and not os.path.isfile(a.orchestrator_template)):
+                msg = t("en", "orch_template_missing",
+                        path=a.orchestrator_template)
+                a.error = msg
+                _log_action("log_orch_template_missing",
+                            name=a.name, path=a.orchestrator_template)
+                print(f"[fona] {a.name}: {msg}",
                       file=sys.stderr, flush=True)
+            else:
+                try:
+                    okwargs = {}
+                    if sys.platform == "win32":
+                        okwargs["creationflags"] = 0x08000000
+                    o_out = open(
+                        os.path.join(_logs_dir(),
+                                     f"{a.id}.orch.out.log"), "wb")
+                    o_err = open(
+                        os.path.join(_logs_dir(),
+                                     f"{a.id}.orch.err.log"), "wb")
+                    try:
+                        cmd = [exe, "-u", "-m", "fona.orchestrator_app",
+                               "--orchestrator", a.url,
+                               "--port", str(a.orchestrator_gradio_port),
+                               "--no-browser"]
+                        if a.orchestrator_template:
+                            cmd += ["--template", a.orchestrator_template]
+                        a.orchestrator_process = subprocess.Popen(
+                            cmd,
+                            env={**os.environ, "FONA_CHILD": "1"},
+                            stdout=o_out, stderr=o_err, **okwargs,
+                        )
+                    finally:
+                        o_out.close()
+                        o_err.close()
+                except Exception as e:
+                    a.error = f"orchestrator spawn failed: {e}"
+                    print(f"[fona] orchestrator spawn failed for "
+                          f"{a.name}: {e}",
+                          file=sys.stderr, flush=True)
 
     def stop(self, agent_id: str) -> None:
         a = self.get(agent_id)
@@ -1518,6 +1561,8 @@ def _agent_to_dict(a: AgentEntry, base_dir: str) -> dict:
         d["source"] = rel(a.source)
         d["source_sha256"] = a.source_sha256
         d["source_mtime"] = a.source_mtime
+    if a.orchestrator_template:
+        d["orchestrator_template"] = rel(a.orchestrator_template)
     return d
 
 
@@ -1530,6 +1575,9 @@ def _dict_to_agent(d: dict, base_dir: str) -> AgentEntry:
 
     script = abspath_or_rel(d.get("script", ""))
     source = abspath_or_rel(d.get("source", "")) if d.get("source") else ""
+    orch_template = (
+        abspath_or_rel(d["orchestrator_template"])
+        if d.get("orchestrator_template") else None)
     return AgentEntry(
         id=d.get("id") or str(uuid.uuid4())[:8],
         name=d.get("name") or Path(script).stem,
@@ -1541,6 +1589,7 @@ def _dict_to_agent(d: dict, base_dir: str) -> AgentEntry:
         source=source,
         source_sha256=d.get("source_sha256", ""),
         source_mtime=float(d.get("source_mtime") or 0.0),
+        orchestrator_template=orch_template,
     )
 
 
@@ -1595,6 +1644,8 @@ def load_team(path: str, *, start_flagged: bool = False
                 existing.autostart = entry.autostart
                 existing.orchestrator_gradio_port = \
                     entry.orchestrator_gradio_port
+                existing.orchestrator_template = \
+                    entry.orchestrator_template
                 if (existing.port != entry.port
                         and _is_port_free(entry.port)):
                     if existing.is_alive():
@@ -1657,7 +1708,6 @@ def _source_badge(a: AgentEntry, lang: str) -> str:
     label = t(lang, "source_changed" if st == "changed"
               else "source_missing")
     if st == "changed":
-        # clickable: update from source and restart
         return (
             f'<a class="update-btn" '
             f'href="javascript:dashAction('
@@ -1725,6 +1775,13 @@ def _card_html(a: AgentEntry, lang: str) -> str:
             f'<span class="v" title="{_esc(a.source)}">'
             f'{_esc(src_name)}{src_extra}{update_link}</span></div>'
         )
+    orch_tpl_html = ""
+    if a.orchestrator_template:
+        orch_tpl_html = (
+            f'<div class="kv"><span class="k">{t(lang, "orch_ui")}</span>'
+            f'<span class="v" title="{_esc(a.orchestrator_template)}">'
+            f'{_esc(os.path.basename(a.orchestrator_template))}</span></div>'
+        )
     ratio = (f"{sum(a.history[-20:])}/{len(a.history[-20:])}"
              if a.history else "\u2014")
     autostart_checked = "checked" if a.autostart else ""
@@ -1752,6 +1809,7 @@ def _card_html(a: AgentEntry, lang: str) -> str:
       <span class="v">{a.actions}</span></div>
     {kb_html}
     {source_html}
+    {orch_tpl_html}
     <div class="kv"><span class="k">{t(lang, "availability")}</span>
       <span class="v">{ratio}</span></div>
     {error_html}
@@ -1971,6 +2029,13 @@ def _attach_dashboard_routes(app):
         _manager.set_autostart(request.query_params.get("id"), val)
         return {"status": "ok"}
 
+    @app.post("/dashboard/orchestrator_template")
+    async def dash_orch_template(request: Request):
+        aid = request.query_params.get("id")
+        path = (request.query_params.get("path") or "").strip() or None
+        _manager.set_orchestrator_template(aid, path)
+        return {"status": "ok"}
+
     # ---------------- Source update ----------------
     @app.post("/dashboard/update_source")
     async def dash_update_source(request: Request):
@@ -2133,6 +2198,18 @@ def build_ui() -> gr.Blocks:
                             label=t(lang, "orch_port_optional"),
                             precision=0, scale=3,
                             elem_classes=["compact-tb"])
+                    with gr.Row(equal_height=True):
+                        new_orch_template_file = gr.File(
+                            label=t(lang, "orch_template_optional"),
+                            file_types=[".py"],
+                            file_count="single",
+                            type="filepath",
+                            elem_classes=["compact-file"])
+                    with gr.Row(equal_height=True):
+                        new_orch_template = gr.Textbox(
+                            placeholder=t(lang, "orch_template_placeholder"),
+                            show_label=False, scale=4,
+                            elem_classes=["compact-tb"])
                     new_name = gr.Textbox(
                         placeholder=t(lang, "name_placeholder"),
                         label=t(lang, "name_optional"),
@@ -2267,7 +2344,8 @@ def build_ui() -> gr.Blocks:
         new_script_browse.click(
             _pick_script_dialog, [], [new_script_manual])
 
-        def _add(lang_code, file_obj, manual_path, port, orch_port, name):
+        def _add(lang_code, file_obj, manual_path, port, orch_port,
+                 orch_tpl_file, orch_tpl_manual, name):
             try:
                 if _active_project is None:
                     return _status_html(
@@ -2312,10 +2390,28 @@ def build_ui() -> gr.Blocks:
                     return _status_html(
                         f"\u2717 {t(lang_code, 'no_script')}")
 
+                # Orchestrator template: manual path wins, else file
+                orch_template = None
+                manual_tpl = (orch_tpl_manual or "").strip()
+                if manual_tpl and os.path.isfile(manual_tpl):
+                    orch_template = manual_tpl
+                else:
+                    tpl_uploaded = _file_to_path(orch_tpl_file)
+                    if tpl_uploaded and os.path.isfile(tpl_uploaded):
+                        tmp = os.path.abspath(tempfile.gettempdir())
+                        is_temp = os.path.abspath(tpl_uploaded).startswith(
+                            tmp + os.sep)
+                        if is_temp:
+                            tpl_dest, _ = _install_script(tpl_uploaded)
+                            orch_template = tpl_dest
+                        else:
+                            orch_template = tpl_uploaded
+
                 entry = _manager.add(
                     script_path, name or "",
                     int(port) if port else 8000,
                     int(orch_port) if orch_port else None,
+                    orch_template,
                 )
                 entry.source = source_path
                 entry.source_sha256 = source_sha
@@ -2332,7 +2428,8 @@ def build_ui() -> gr.Blocks:
         add_btn.click(
             _add,
             [lang_state, new_script_file, new_script_manual,
-             new_port, new_orch_port, new_name],
+             new_port, new_orch_port,
+             new_orch_template_file, new_orch_template, new_name],
             [add_status],
         ).then(
             _refresh, [lang_state],
