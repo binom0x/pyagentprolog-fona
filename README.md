@@ -67,7 +67,7 @@ Python 3.10+. `torch` / `sentence-transformers` are optional (`[torch]`, `[seman
 
 ## Documentation
 
-The full guide — architecture, decorators, HITL, inter-agent protocol, `query_one`, REST contract, HF cache, dashboard, orchestrator, security, testing, releases, known limitations — lives in [`docs/guide.md`](docs/guide.md).
+The full guide — architecture, decorators, HITL, inter-agent protocol, `query_one`, REST contract, HF cache, dashboard, orchestrator, security, testing, releases, known limitations — lives in [docs/guide.md](https://github.com/binom0x/pyagentprolog-fona/blob/main/doc/guide.md)
 
 Start there. This README intentionally does not duplicate it.
 
@@ -112,4 +112,4 @@ See `LICENSE`.
 
 ---
 
-**One line:** Fona lets you write an agent as a Prolog program plus Python actions, serve it over HTTP with a chat UI, and let it talk to other agents — all through one Prolog-only protocol. For everything else, read [`docs/guide.md`](docs/guide.md).
+**One line:** Fona lets you write an agent as a Prolog program plus Python actions, serve it over HTTP with a chat UI, and let it talk to other agents — all through one Prolog-only protocol. For everything else, read [docs/guide.md](https://github.com/binom0x/pyagentprolog-fona/blob/main/doc/guide.md)
