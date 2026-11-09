@@ -28,9 +28,6 @@ if TYPE_CHECKING:
     from pyagentprolog_hf import PyAgentPrologModel
 
 
-# =====================================================================
-# Session with query_one semantics (only the first solution of run/0)
-# =====================================================================
 class QueryOneSession(AgentGradioSession):
     """HITL session that calls query_one instead of query.
 
@@ -64,9 +61,6 @@ def _create_query_one_session() -> str:
     return sid
 
 
-# =====================================================================
-# Schemas
-# =====================================================================
 class _InputRequest(BaseModel):
     session_id: str
     text: str
@@ -78,9 +72,6 @@ class _QueryRequest(BaseModel):
     with_explanation: Optional[bool] = None
 
 
-# =====================================================================
-# FastAPI
-# =====================================================================
 def create_app(
     model: Any,
     *,
@@ -192,12 +183,16 @@ def create_app(
     if with_rest:
         @app.get("/api/v1/health")
         def health():
-            return {"status": "ok"}
+            return {"status": "ok", "pid": os.getpid()}
 
         @app.get("/api/v1/model")
         def model_info_endpoint(x_api_key: Optional[str] = Header(default=None)):
             check_token(x_api_key)
             cfg = model.config
+            # Identity: the dashboard (or the user) sets these via env.
+            # team_name — the project the agent belongs to.
+            # agent_name — the name of the agent within the project.
+            # Both are optional; None if not set.
             return {
                 'name_or_path': getattr(model, 'name_or_path', None),
                 'rules_count': len(model.agent.solver.database.rules),
@@ -207,6 +202,8 @@ def create_app(
                 'default_main': getattr(cfg, 'default_main', None),
                 'max_solutions': getattr(cfg, 'max_solutions', 0),
                 'actions': model.agent.list_actions(),
+                'agent_name': os.getenv('FONA_AGENT_NAME') or None,
+                'team_name': os.getenv('FONA_TEAM_NAME') or None,
             }
 
         @app.post("/api/v1/query")
@@ -275,4 +272,5 @@ def create_app(
 
 
 def run_uvicorn(app, host: str = '127.0.0.1', port: int = 8000):
-    uvicorn.run(app, host=host, port=port, log_level="info")
+    uvicorn.run(app, host=host, port=port, log_level="info",
+                reload=False, workers=1)

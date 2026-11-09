@@ -47,7 +47,8 @@ ALLOWED_ENV = {"PATH", "HOME", "USER", "LANG", "FONA_PORT"}
 # =====================================================================
 # Transport + default protocol — one line each, identical for all agents
 # =====================================================================
-register_peers(agent, CFG)
+from fona import team_resolver
+register_peers(agent, CFG, resolver=team_resolver)
 register_protocol(agent)
 
 

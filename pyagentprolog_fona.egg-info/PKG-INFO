@@ -6,6 +6,7 @@ Author-email: Andrey Vorfolomeev <binom0x@proton.me>
 License: MIT
 Requires-Python: >=3.10
 Description-Content-Type: text/markdown
+License-File: LICENSE
 Requires-Dist: fastapi>=0.110
 Requires-Dist: uvicorn[standard]>=0.29
 Requires-Dist: httpx>=0.27
@@ -21,6 +22,7 @@ Requires-Dist: sentence-transformers>=3.0; extra == "semantic"
 Provides-Extra: all
 Requires-Dist: torch>=2.0; extra == "all"
 Requires-Dist: sentence-transformers>=3.0; extra == "all"
+Dynamic: license-file
 
 # Fona
 

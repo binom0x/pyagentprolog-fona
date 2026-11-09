@@ -1,32 +1,41 @@
-"""Fona Dashboard — manage and monitor background agents.
+"""Fona Dashboard — manage and monitor background agents (v4.5).
 
-Features:
-  * project = folder: create/open a project folder that holds
-    team.json, scripts/ (agent copies) and logs/ (runtime)
-  * add/remove agents (file picker, drag-drop, or manual path)
-  * start/stop/restart, change port with live validation
-  * live status cards: uptime, latency, rules, actions, sparkline
-  * per-agent `autostart` flag decides who starts on "Load and start"
-  * per-agent `orchestrator_template` — path to a custom Gradio UI
-    module (e.g. examples/orchestrator_template.py); when set, the
-    "Orchestrator" button on the card launches it
-  * source tracking: every copied agent remembers its origin
-    (path + sha256 + mtime); the card shows a badge when the
-    source changed or disappeared, and a single click updates
-    the copy and restarts the agent (deliberate action)
-  * action log of all dashboard operations
-  * i18n: English / Russian switchable at runtime
-  * stdout/stderr are written to <project>/logs/<agent_id>.{out,err}.log
-  * on crash, the real stderr tail is shown in the card (no hiding)
-  * the actual uvicorn port is auto-detected from the child's stdout
-  * children are tracked in <project>/logs/children.json; orphans from
-    a previous dashboard run are killed on project open; a graceful
-    shutdown (Ctrl+C) kills the ones we started
+Key changes vs v4.4:
+  * FIX T: _walk_team_files + recursive _autodetect_team_files
+    (depth<=3, skip .git/node_modules/venv/...). team.json in
+    examples/<team>/ is now found on launch.
+  * FIX U: _live_scan_any falls back to DEFAULT_PORT_RANGE = (8020, 8099)
+    when no team.json exists, so the Adopted tab is populated from
+    startup, regardless of whether a project is open.
+  * FIX V: _pick_directory_dialog(title) — custom dialog title.
+  * FIX W: Project.from_folder(root) — open by folder, autodetect
+    team.json in root or up to 3 levels down.
+  * FIX X/Y: redesigned Project section:
+        [ Open project… ] [ Create project… ] [ Close ]
+    No manual name/port_range/path fields. Opening a folder without
+    team.json offers to create the project in that folder.
+  * FIX Z: demo.load(_refresh, ...) refreshes cards AND Adopted tab
+    immediately on page load.
+  * FIX AA: _do_close releases adopted agents but does not kill them.
+    (Model "processes survive the dashboard" is preserved.)
 
-Run:
-    python -m fona.dashboard
-    fona-dashboard --port 7861
-    FONA_DASHBOARD_LANG=ru python -m fona.dashboard --port 7861
+Previous fixes (A–S) are kept:
+  A: Project.open migrates team.json v1/v2/v3 -> v4.
+  B: start() kills stale python on the port BEFORE Popen.
+  C: poll() is a pure observer; never kills, never clears a.process.
+  D: _is_pid_alive (WaitForSingleObject); _kill_pid rc=128 no-op.
+  E: orphan cleanup in port_range before adoption.
+  F: team_resolver live scan (in fona/team.py).
+  G: _allocate_for() allocates both ports; gated by with_orch (M).
+  H: pid mismatch signalled only when FONA_STRICT_PID=1 and not adopted.
+  I: start() adopt branch clears a.process.
+  J: _child_env strips UVICORN_RELOAD and WEB_CONCURRENCY.
+  L: "Load and start" force-starts every non-online agent.
+  M: Orchestrator button only if template AND port are set.
+  N: Project autodetect on launch.
+  O: load_team preserves adopted state if process is still serving.
+  R: _on_project_open no longer calls stop_all/clear.
+  S: _ensure_startup_project logs when >1 team.json is found.
 """
 from __future__ import annotations
 
@@ -56,6 +65,9 @@ import httpx
 from fastapi import Request
 from fastapi.responses import PlainTextResponse
 
+from .live_scan import scan_range, LiveAgent
+
+
 # ============================================================================
 # i18n
 # ============================================================================
@@ -63,53 +75,66 @@ TRANSLATIONS = {
     "en": {
         "title": "Fona Dashboard",
         "agents": "Agents", "summary": "Summary",
+        "tab_agents": "Agents",
+        "tab_adopted": "Adopted / Live",
+        "adopted_agents": "Live agents in port range",
+        "no_live_agents": "No live agents in the port range.",
+        "team_col": "Team", "name_col": "Name", "port_col": "Port",
+        "status_col": "Status", "actions_col": "Actions",
+        "kill": "Kill", "adopted_badge": "ADOPTED",
         "project": "Project",
-        "project_path_placeholder": "/path/to/my-team",
-        "project_name_placeholder": "team name (optional)",
-        "project_create": "Create",
-        "project_open": "Open",
-        "project_created": "Project created",
-        "project_opened": "Project opened",
+        "project_open_btn": "Open",
+        "project_create_btn": "Create",
+        "project_close_btn": "Close",
+        "project_none": "No project open",
+        "project_summary":
+            "{name} — {n} agent(s), ports {start}-{end}",
+        "project_dialog_open_title":
+            "Choose a project folder (with team.json)",
+        "project_dialog_create_title":
+            "Choose an empty folder to create a new project",
+        "project_multi_found":
+            "Multiple team.json found under the folder; pick the exact "
+            "folder or run with FONA_TEAM_FILE",
+        "project_create_exists":
+            "Folder already contains team.json — opening it instead",
+        "project_create_invalid":
+            "Cannot create project: {msg}",
+        "project_open_failed": "Open failed: {msg}",
+        "project_closed": "Project closed",
         "project_path_required": "Project folder is required",
+        "project_name_placeholder": "team name (optional)",
+        "port_range_invalid": "Invalid port range",
         "no_project": "No project open. Create or open one first.",
         "no_project_active": "No active project",
         "add_agent": "Add Agent", "action_log": "Action Log",
         "team": "Team", "script": "Script",
         "select_script": "Script file (drag or click)",
         "manual_path": "or paste absolute path",
-        "port": "Port", "port_placeholder": "8000",
         "name_optional": "Name (optional)", "name_placeholder": "my-agent",
-        "orch_port_optional": "Orchestrator port (opt)",
-        "orch_port_placeholder": "8010",
         "orch_template_optional": "Orchestrator UI template (opt)",
         "orch_template_placeholder": "path/to/orchestrator_template.py",
         "orch_template_missing":
             "orchestrator template not found: {path}",
         "orch_ui": "orch ui",
         "add": "Add",
-        "start": "Start", "stop": "Stop", "restart": "Restart",
-        "remove": "Remove",
+        "start": "Start", "stop": "Stop", "restart": "Restart", 
+        "remove": "Remove", "stop_all": "Stop all",
+        "release": "Release",
         "open_ui": "Open UI", "open_orchestrator": "Orchestrator",
         "uptime": "uptime", "latency": "latency", "rules": "rules",
         "actions": "actions", "availability": "availability", "kb": "KB",
         "error": "error", "autostart": "autostart",
+        "autostart_hint": "Start automatically when the project is opened",
         "online": "ONLINE", "offline": "OFFLINE",
         "starting": "STARTING", "stopped": "STOPPED",
-        "error_status": "ERROR",
-        "save": "Save", "load": "Load",
+        "adopted": "ADOPTED", "error_status": "ERROR",
+        "save": "Save",
         "load_and_start": "Load and start",
-        "load_hint_v2": (
-            "Save writes team.json into the project folder. "
-            "Load re-reads it. Load and start also launches agents "
-            "whose per-card autostart flag is checked."),
         "empty_state": "No agents. Add a script in the panel on the left.",
-        "empty_hint": "Example: examples/demo_agent.py, port 8000",
-        "change_port_prompt": "New port for {name} (current {current}):",
+        "empty_hint": "Example: examples/demo_agent.py",
         "confirm_remove": "Remove {name}?",
-        "not_found": "not found",
-        "port_conflict": "Port {port} is already used by {name}",
-        "port_busy": "Port {port} is already in use by another process",
-        "port_invalid": "Port must be 1..65535",
+        "no_free_port": "No free port in range {start}..{end}",
         "script_missing": "Script not found: {path}",
         "no_script": "No script provided",
         "logs": "Logs",
@@ -126,49 +151,80 @@ TRANSLATIONS = {
         "status_total": "total", "status_online": "online",
         "status_offline": "offline", "status_stopped": "stopped",
         "status_starting": "starting",
-        "log_added": "Added {name} \u2192 {url}",
-        "log_started": "Started {name}",
-        "log_adopted": "Adopted running process for {name} on port {port}",
+        "log_added": "Added {name}",
+        "log_started": "Started {name} on port {port}",
+        "log_adopted": "Adopted {name} on port {port}",
+        "log_released": "Released {name} on port {port} (not killed)",
+        "log_killed_live": "Killed pid={pid} on port {port}",
+        "log_killed_orphan": "Killed orphan pid={pid} on port {port}",
         "log_recovered": "Recovered {name}: process exit was transient, "
                          "port {port} is serving",
         "log_start_failed": "Failed to start {name}: {reason}",
         "log_stopped": "Stopped {name}",
         "log_restarted": "Restarted {name}",
         "log_removed": "Removed {name}",
-        "log_port_changed": "Changed port of {name} to {port}",
         "log_team_saved": "Saved team to {path}",
         "log_team_loaded": "Loaded team from {path} (+{n})",
         "log_team_loaded_started": ("Loaded team from {path} (+{n}); "
-                                    "started {started} flagged agent(s)"),
+                                    "started {started} agent(s)"),
         "log_project_created": "Created project at {path}",
         "log_project_opened": "Opened project at {path} (+{n})",
+        "log_project_autodetected": "Autodetected project at {path}",
+        "log_project_autodetect_ambiguous":
+            "Multiple team.json found ({n}); open one manually",
+        "log_project_closed": "Closed project",
         "log_script_missing": "Script missing for {name}: {path}",
         "log_source_updated": "Updated {name} from {path}",
-        "log_killed_stale": "Killed stale python process {pid} on port {port}",
         "log_orch_template_missing":
             "Orchestrator template missing for {name}: {path}",
+        "log_pid_mismatch":
+            "Port {port} serves a different process for {name}",
+        "log_child_died":
+            "{name} exited immediately after start (rc={rc}): {tail}",
+        "log_stop_all": "Stopping all agents",
+        "log_migrated_v3": "Migrated team.json v3 -> v4",
+        "log_orphans_cleaned": "Killed {n} orphan process(es) in port range",
     },
     "ru": {
         "title": "Дашборд Fona",
         "agents": "Агенты", "summary": "Сводка",
+        "tab_agents": "Агенты",
+        "tab_adopted": "Усыновлённые / Живые",
+        "adopted_agents": "Живые агенты в диапазоне портов",
+        "no_live_agents": "Нет живых агентов в диапазоне портов.",
+        "team_col": "Команда", "name_col": "Имя", "port_col": "Порт",
+        "status_col": "Статус", "actions_col": "Действия",
+        "kill": "Убить", "adopted_badge": "УСЫНОВЛЁН",
         "project": "Проект",
-        "project_path_placeholder": "/путь/к/команде",
-        "project_name_placeholder": "имя команды (опционально)",
-        "project_create": "Создать",
-        "project_open": "Открыть",
-        "project_created": "Проект создан",
-        "project_opened": "Проект открыт",
+        "project_open_btn": "Открыть",
+        "project_create_btn": "Создать",
+        "project_close_btn": "Закрыть",
+        "project_none": "Проект не открыт",
+        "project_summary":
+            "{name} — агентов: {n}, порты {start}-{end}",
+        "project_dialog_open_title":
+            "Выберите папку проекта (с team.json)",
+        "project_dialog_create_title":
+            "Выберите пустую папку для нового проекта",
+        "project_multi_found":
+            "В папке несколько team.json; укажите конкретную папку или "
+            "задайте FONA_TEAM_FILE",
+        "project_create_exists":
+            "В папке уже есть team.json — открываю её",
+        "project_create_invalid":
+            "Не удалось создать проект: {msg}",
+        "project_open_failed": "Ошибка открытия: {msg}",
+        "project_closed": "Проект закрыт",
         "project_path_required": "Укажите папку проекта",
+        "project_name_placeholder": "имя команды (опционально)",
+        "port_range_invalid": "Неверный диапазон портов",
         "no_project": "Проект не открыт. Создайте или откройте его.",
         "no_project_active": "Проект не открыт",
         "add_agent": "Добавить агента", "action_log": "Журнал действий",
         "team": "Команда", "script": "Скрипт",
         "select_script": "Файл скрипта (перетащите или нажмите)",
         "manual_path": "или вставьте абсолютный путь",
-        "port": "Порт", "port_placeholder": "8000",
         "name_optional": "Имя (опционально)", "name_placeholder": "мой-агент",
-        "orch_port_optional": "Порт оркестратора (опц)",
-        "orch_port_placeholder": "8010",
         "orch_template_optional": "Шаблон UI оркестратора (опц)",
         "orch_template_placeholder": "путь/к/orchestrator_template.py",
         "orch_template_missing":
@@ -176,28 +232,22 @@ TRANSLATIONS = {
         "orch_ui": "UI оркестратора",
         "add": "Добавить",
         "start": "Старт", "stop": "Стоп", "restart": "Перезапустить",
-        "remove": "Удалить",
+        "remove": "Удалить", "stop_all": "Остановить всё",
+        "release": "Отпустить",
         "open_ui": "Открыть UI", "open_orchestrator": "Оркестратор",
         "uptime": "аптайм", "latency": "задержка", "rules": "правил",
         "actions": "действий", "availability": "доступность", "kb": "БЗ",
         "error": "ошибка", "autostart": "автозапуск",
+        "autostart_hint": "Запускать автоматически при открытии проекта",
         "online": "ОНЛАЙН", "offline": "ОФЛАЙН",
         "starting": "СТАРТ", "stopped": "СТОП",
-        "error_status": "ОШИБКА",
-        "save": "Сохранить", "load": "Загрузить",
+        "adopted": "УСЫНОВЛЁН", "error_status": "ОШИБКА",
+        "save": "Сохранить",
         "load_and_start": "Загрузить и запустить",
-        "load_hint_v2": (
-            "«Сохранить» пишет team.json в папку проекта. "
-            "«Загрузить» перечитывает его. «Загрузить и запустить» "
-            "дополнительно запускает агентов с флагом autostart."),
         "empty_state": "Нет агентов. Добавьте скрипт в панели слева.",
-        "empty_hint": "Пример: examples/demo_agent.py, порт 8000",
-        "change_port_prompt": "Новый порт для {name} (текущий {current}):",
+        "empty_hint": "Пример: examples/demo_agent.py",
         "confirm_remove": "Удалить {name}?",
-        "not_found": "не найден",
-        "port_conflict": "Порт {port} уже занят агентом {name}",
-        "port_busy": "Порт {port} занят другим процессом на этой машине",
-        "port_invalid": "Порт должен быть 1..65535",
+        "no_free_port": "Нет свободного порта в диапазоне {start}..{end}",
         "script_missing": "Скрипт не найден: {path}",
         "no_script": "Скрипт не указан",
         "logs": "Логи",
@@ -214,27 +264,40 @@ TRANSLATIONS = {
         "status_total": "всего", "status_online": "онлайн",
         "status_offline": "офлайн", "status_stopped": "остановлен",
         "status_starting": "стартует",
-        "log_added": "Добавлен {name} \u2192 {url}",
-        "log_started": "Запущен {name}",
-        "log_adopted": "Принят работающий процесс {name} на порту {port}",
+        "log_added": "Добавлен {name}",
+        "log_started": "Запущен {name} на порту {port}",
+        "log_adopted": "Усыновлён {name} на порту {port}",
+        "log_released": "Отпущен {name} на порту {port} (не убит)",
+        "log_killed_live": "Убит pid={pid} на порту {port}",
+        "log_killed_orphan": "Убит осиротевший pid={pid} на порту {port}",
         "log_recovered": "Восстановлен {name}: выход процесса был "
                          "кратковременным, порт {port} обслуживается",
         "log_start_failed": "Ошибка запуска {name}: {reason}",
         "log_stopped": "Остановлен {name}",
         "log_restarted": "Перезапущен {name}",
         "log_removed": "Удалён {name}",
-        "log_port_changed": "Изменён порт {name} на {port}",
         "log_team_saved": "Команда сохранена в {path}",
         "log_team_loaded": "Команда загружена из {path} (+{n})",
         "log_team_loaded_started": ("Команда загружена из {path} (+{n}); "
-                                    "запущено {started} агентов с флагом"),
+                                    "запущено {started} агент(ов)"),
         "log_project_created": "Создан проект в {path}",
         "log_project_opened": "Открыт проект в {path} (+{n})",
+        "log_project_autodetected": "Автоопределён проект в {path}",
+        "log_project_autodetect_ambiguous":
+            "Найдено несколько team.json ({n}); откройте вручную",
+        "log_project_closed": "Проект закрыт",
         "log_script_missing": "Скрипт не найден для {name}: {path}",
         "log_source_updated": "Обновлён {name} из {path}",
-        "log_killed_stale": "Убит устаревший python-процесс {pid} на порту {port}",
         "log_orch_template_missing":
             "Шаблон оркестратора не найден для {name}: {path}",
+        "log_pid_mismatch":
+            "На порту {port} отвечает другой процесс для {name}",
+        "log_child_died":
+            "{name} завершился сразу после старта (rc={rc}): {tail}",
+        "log_stop_all": "Останавливаю всех агентов",
+        "log_migrated_v3": "team.json миграция v3 -> v4",
+        "log_orphans_cleaned":
+            "Убито {n} осиротевших процесс(ов) в диапазоне портов",
     },
 }
 
@@ -288,7 +351,7 @@ _IS_GRADIO6 = _GRADIO_VERSION >= (6, 0)
 
 
 # ============================================================================
-# PYTHONPATH for children
+# PYTHONPATH / env for children
 # ============================================================================
 def _python_paths() -> List[str]:
     here = os.path.dirname(os.path.abspath(__file__))
@@ -302,11 +365,22 @@ def _python_paths() -> List[str]:
     return paths
 
 
-def _child_env(port: int) -> dict:
+def _child_env(port: int,
+               agent_name: Optional[str] = None,
+               team_name: Optional[str] = None,
+               extra: Optional[Dict[str, str]] = None,
+               team_file: Optional[str] = None) -> dict:
     env = os.environ.copy()
     env["FONA_CHILD"] = "1"
     env["FONA_PORT"] = str(port)
+    if agent_name:
+        env["FONA_AGENT_NAME"] = agent_name
+    if team_name:
+        env["FONA_TEAM_NAME"] = team_name
+    if team_file:
+        env["FONA_TEAM_FILE"] = team_file
     env.pop("WEB_CONCURRENCY", None)
+    env.pop("UVICORN_RELOAD", None)
     existing = env.get("PYTHONPATH", "")
     parts = existing.split(os.pathsep) if existing else []
     for p in reversed(_python_paths()):
@@ -314,6 +388,8 @@ def _child_env(port: int) -> dict:
             parts.insert(0, p)
     if parts:
         env["PYTHONPATH"] = os.pathsep.join(parts)
+    if extra:
+        env.update({str(k): str(v) for k, v in extra.items()})
     return env
 
 
@@ -464,6 +540,7 @@ pre.status-box {
 .card.starting{ border-left: 4px solid #d29922; }
 .card.stopped { border-left: 4px solid #484f58; }
 .card.error   { border-left: 4px solid #f85149; }
+.card.adopted { border-left: 4px solid #58a6ff; }
 .card-head { display: flex; justify-content: space-between;
              align-items: center; gap: 8px; }
 .card-title { font-weight: 600; font-size: 13px; color: #c7cbd1; }
@@ -472,10 +549,11 @@ pre.status-box {
 .badge { font-size: 10px; padding: 2px 8px; border-radius: 10px;
          font-weight: 600; letter-spacing: .3px; text-transform: uppercase; }
 .badge.online   { background: #0f2a1a; color: #7ee787; }
-.badge.offline  { background: #0f2a1a; color: #ff7b72; }
+.badge.offline  { background: #2a0f12; color: #ff7b72; }
 .badge.starting { background: #2a1f0f; color: #e3b341; }
 .badge.stopped  { background: #21262d; color: #8b949e; }
 .badge.error    { background: #2a0f12; color: #ff7b72; }
+.badge.adopted  { background: #1c2a3a; color: #58a6ff; }
 .badge.source-warn { background: #2a1f0f; color: #e3b341; }
 .card-body { display: flex; flex-direction: column; gap: 4px;
              font-size: 12px; color: #c7cbd1; }
@@ -510,6 +588,30 @@ pre.status-box {
 .empty-state { padding: 40px 20px; text-align: center; color: #8b949e;
     border: 1px dashed #2a313d; border-radius: 8px; font-size: 13px; }
 .sparkline { width: 100%; height: 30px; margin-top: 4px; }
+
+/* Live agents table */
+.live-table { display: flex; flex-direction: column;
+              border: 1px solid #2a313d; border-radius: 6px;
+              overflow: hidden; }
+.live-header { display: grid;
+               grid-template-columns: 140px 1fr 70px 80px 100px 200px;
+               background: #0b0d11; border-bottom: 1px solid #2a313d;
+               font-size: 11px; color: #8b949e; font-weight: 600; }
+.live-row { display: grid;
+            grid-template-columns: 140px 1fr 70px 80px 100px 200px;
+            border-bottom: 1px solid #161a20; }
+.live-row:last-child { border-bottom: none; }
+.live-row.online  { border-left: 3px solid #238636; }
+.live-row.error   { border-left: 3px solid #f85149; }
+.live-cell { padding: 6px 8px; font-size: 12px;
+             display: flex; align-items: center; gap: 6px;
+             overflow: hidden; text-overflow: ellipsis;
+             white-space: nowrap; }
+.live-team, .live-name, .live-port, .live-pid {
+    font-family: ui-monospace, monospace; font-size: 11px;
+}
+.live-team.team-ours { color: #58a6ff; font-weight: 600; }
+.live-actions { justify-content: flex-end; }
 """
 
 _HEAD_DARK = """
@@ -608,13 +710,20 @@ def _get_action_log(lang: str) -> str:
 
 
 # ============================================================================
+# Constants
+# ============================================================================
+DEFAULT_PORT_RANGE: Tuple[int, int] = (8020, 8099)
+TEAM_VERSION = 4
+
+
+# ============================================================================
 # Project (folder = team)
 # ============================================================================
 @dataclass
 class Project:
-    """A project folder: team.json + scripts/ + logs/."""
     root: str
     name: str
+    port_range: Tuple[int, int] = DEFAULT_PORT_RANGE
 
     @property
     def team_file(self) -> str:
@@ -633,23 +742,89 @@ class Project:
             os.makedirs(d, exist_ok=True)
 
     @classmethod
-    def create(cls, root: str, name: str = "") -> "Project":
+    def create(cls, root: str, name: str = "",
+               port_range: Tuple[int, int] = DEFAULT_PORT_RANGE) -> "Project":
         root = os.path.abspath(root)
-        p = cls(root=root, name=name or os.path.basename(root))
+        p = cls(root=root, name=name or os.path.basename(root),
+                port_range=port_range)
         p.ensure()
         return p
 
     @classmethod
     def open(cls, root: str) -> "Project":
         root = os.path.abspath(root)
-        if not os.path.isfile(os.path.join(root, "team.json")):
+        team_file = os.path.join(root, "team.json")
+        if not os.path.isfile(team_file):
             raise FileNotFoundError(f"team.json not found in {root}")
-        p = cls(root=root, name=os.path.basename(root))
+        name = os.path.basename(root)
+        port_range: Tuple[int, int] = DEFAULT_PORT_RANGE
+        try:
+            with open(team_file, "r", encoding="utf-8") as f:
+                payload = _json.load(f)
+            name = payload.get("name") or name
+            version = int(payload.get("version", 1))
+
+            if version < 4:
+                agents = payload.get("agents") or []
+                old_ports: List[int] = []
+                for a in agents:
+                    for key in ("port", "orchestrator_gradio_port"):
+                        try:
+                            v = int(a.get(key) or 0)
+                        except (TypeError, ValueError):
+                            v = 0
+                        if v:
+                            old_ports.append(v)
+                        a.pop(key, None)
+                    a.pop("port_range", None)
+                if old_ports:
+                    pr = (min(old_ports), max(old_ports) + 10)
+                else:
+                    pr = DEFAULT_PORT_RANGE
+                payload["version"] = 4
+                payload["port_range"] = list(pr)
+                payload["agents"] = agents
+                with open(team_file, "w", encoding="utf-8") as f:
+                    _json.dump(payload, f, indent=2, ensure_ascii=False)
+                port_range = pr
+                _log_action("log_migrated_v3")
+            else:
+                pr = payload.get("port_range")
+                if isinstance(pr, (list, tuple)) and len(pr) == 2:
+                    port_range = (int(pr[0]), int(pr[1]))
+        except Exception:
+            pass
+        p = cls(root=root, name=name, port_range=port_range)
         p.ensure()
         return p
 
+    @classmethod
+    def from_folder(cls, root: str) -> "Project":
+        """Open root as a project. team.json may be at root or one of
+        the next 3 levels. Raise if none or if multiple.
+
+        FIX W: this is the entry point for the "Open project…" button.
+        """
+        root = os.path.abspath(root)
+        if not os.path.isdir(root):
+            raise FileNotFoundError(f"not a directory: {root}")
+        direct = os.path.join(root, "team.json")
+        if os.path.isfile(direct):
+            return cls.open(root)
+        nested = _walk_team_files(root, max_depth=3)
+        if not nested:
+            raise FileNotFoundError(f"no team.json under {root}")
+        if len(nested) > 1:
+            raise ValueError(
+                f"multiple team.json under {root}: {len(nested)}")
+        return cls.open(os.path.dirname(nested[0]))
+
 
 _active_project: Optional[Project] = None
+_do_not_adopt: set = set()
+# FIX EE: cache mtime of team.json to auto-reload on external change.
+_team_mtime_cache: Dict[str, float] = {}
+_RELOAD_EPS = 0.5  # ignore sub-second mtime jitter on some FS
 
 
 def _logs_dir() -> str:
@@ -707,55 +882,203 @@ def _detect_uvicorn_port_from_logs(agent_id: str) -> Optional[int]:
 
 
 # ============================================================================
-# PID/port tracking for child processes
+# Project autodetection (FIX N, S, T)
 # ============================================================================
-def _pid_file() -> str:
-    return os.path.join(_logs_dir(), "children.json")
+_SKIP_DIRS = {".git", "node_modules", "__pycache__", "venv", ".venv",
+              "build", "dist", ".idea", ".vscode", ".mypy_cache",
+              ".pytest_cache", ".ruff_cache", "site-packages"}
 
 
-def _load_pid_map() -> Dict[str, Dict[str, int]]:
+def _walk_team_files(root: str, max_depth: int = 3) -> List[str]:
+    """Recursively find team.json up to max_depth levels under root."""
+    found: List[str] = []
+    root = os.path.abspath(root)
+    base_depth = root.count(os.sep)
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        depth = dirpath.count(os.sep) - base_depth
+        dirnames[:] = [d for d in dirnames
+                       if d not in _SKIP_DIRS and not d.startswith(".")]
+        if depth >= max_depth:
+            dirnames[:] = []
+            continue
+        if "team.json" in filenames:
+            found.append(os.path.join(dirpath, "team.json"))
+    return found
+
+
+def _autodetect_team_files() -> List[str]:
+    """Find team.json recursively under cwd (up to 3 levels)."""
+    cwd = os.getcwd()
+    candidates = _walk_team_files(cwd, max_depth=3)
+    env_team = (os.environ.get("FONA_TEAM_FILE") or "").strip()
+    if env_team and os.path.isfile(env_team) and env_team not in candidates:
+        candidates.insert(0, env_team)
+    return candidates
+
+
+def _ensure_startup_project() -> None:
+    """Autodetect and open a project on dashboard launch."""
+    global _active_project
+    if _active_project is not None:
+        return
+    candidates = _autodetect_team_files()
+    if not candidates:
+        print("[fona] no team.json found under cwd (depth <= 3)",
+              file=sys.stderr, flush=True)
+        return
+    if len(candidates) > 1:
+        _log_action("log_project_autodetect_ambiguous", n=len(candidates))
+        print(f"[fona] multiple team.json found ({len(candidates)}):",
+              file=sys.stderr, flush=True)
+        for c in candidates[:5]:
+            print(f"[fona]   {c}", file=sys.stderr, flush=True)
+        return
     try:
-        with open(_pid_file(), "r", encoding="utf-8") as f:
-            data = _json.load(f)
+        project = Project.open(candidates[0])
+        _active_project = project
+        try:
+            load_team(project.team_file, start_flagged=False)
+        except Exception as e:
+            print(f"[fona] startup load failed: {e}",
+                  file=sys.stderr, flush=True)
+        # FIX GG: autostart agents come up with the project. This is
+        # the only place where the flag actually starts something;
+        # auto-reload (_maybe_reload_team) deliberately does NOT.
+        try:
+            for a in list(_manager.list()):
+                if a.autostart and a.status != "online":
+                    _manager.start(a.id)
+        except Exception as e:
+            print(f"[fona] autostart on launch failed: {e}",
+                  file=sys.stderr, flush=True)
+        _log_action("log_project_autodetected", path=project.root)
+        try:
+            _team_mtime_cache[project.team_file] = os.path.getmtime(
+                project.team_file)
+        except OSError:
+            pass
+        print(f"[fona] autodetected project: {project.root} "
+              f"(port_range={project.port_range})",
+              file=sys.stderr, flush=True)
+    except Exception as e:
+        print(f"[fona] autodetect open failed: {e}",
+              file=sys.stderr, flush=True)
+
+
+def _known_port_ranges() -> List[Tuple[int, int]]:
+    ranges: List[Tuple[int, int]] = []
+    if _active_project is not None:
+        ranges.append(_active_project.port_range)
+    for path in _autodetect_team_files():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = _json.load(f)
+            pr = payload.get("port_range")
+            if isinstance(pr, (list, tuple)) and len(pr) == 2:
+                pr = (int(pr[0]), int(pr[1]))
+                if pr not in ranges:
+                    ranges.append(pr)
+        except Exception:
+            continue
+    return ranges
+
+
+def _live_scan_any() -> List[LiveAgent]:
+    """Scan all known port ranges; fall back to DEFAULT_PORT_RANGE.
+
+    FIX U: Adopted tab must show live agents regardless of whether a
+    project is open. If no team.json exists at all, scan the standard
+    Fona range — scan_range only returns ports that answer
+    /api/v1/model, so it is harmless if nothing is there.
+    """
+    ranges = _known_port_ranges()
+    if not ranges:
+        ranges = [DEFAULT_PORT_RANGE]
+    start = min(r[0] for r in ranges)
+    end = max(r[1] for r in ranges)
+    try:
+        return scan_range(start, end)
     except Exception:
-        return {}
-
-    result: Dict[str, Dict[str, int]] = {}
-    for k, v in data.items():
-        if isinstance(v, dict):
-            result[str(k)] = {
-                "pid": int(v.get("pid", 0) or 0),
-                "port": int(v.get("port", 0) or 0),
-            }
-        else:
-            try:
-                result[str(k)] = {"pid": int(v), "port": 0}
-            except (TypeError, ValueError):
-                pass
-    return result
+        return []
 
 
-def _save_pid_map(m: Dict[str, Dict[str, int]]) -> None:
+# ============================================================================
+# Port helpers
+# ============================================================================
+def _is_port_open(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.15)
+        try:
+            return s.connect_ex(("127.0.0.1", port)) == 0
+        except OSError:
+            return False
+
+
+def _is_port_free(port: int) -> bool:
+    if _is_port_open(port):
+        return False
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        if sys.platform != "win32":
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("127.0.0.1", port))
+            return True
+        except OSError:
+            return False
+
+
+def _health_ok(url: str, timeout: float = 1.0) -> bool:
     try:
-        with open(_pid_file(), "w", encoding="utf-8") as f:
-            _json.dump(m, f, indent=2)
-    except OSError:
+        r = httpx.get(f"{url}/api/v1/health", timeout=timeout)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+def _health_pid(url: str, timeout: float = 1.0) -> Optional[int]:
+    try:
+        r = httpx.get(f"{url}/api/v1/health", timeout=timeout)
+        if r.status_code == 200:
+            try:
+                return int(r.json().get("pid", 0)) or None
+            except Exception:
+                return None
+    except Exception:
         pass
+    return None
 
 
+def _allocate_port(used: set, range_start: int, range_end: int) -> int:
+    for port in range(range_start, range_end + 1):
+        if port in used:
+            continue
+        if _is_port_free(port):
+            return port
+    raise RuntimeError(
+        f"no free port in range {range_start}..{range_end}")
+
+
+# ============================================================================
+# PID helpers
+# ============================================================================
 def _is_pid_alive(pid: int) -> bool:
     if not pid or pid <= 0:
         return False
     if sys.platform == "win32":
         try:
             import ctypes
-            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            SYNCHRONIZE = 0x00100000
+            WAIT_TIMEOUT = 0x00000102
             h = ctypes.windll.kernel32.OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+                SYNCHRONIZE, False, int(pid))
             if not h:
                 return False
-            ctypes.windll.kernel32.CloseHandle(h)
-            return True
+            try:
+                rc = ctypes.windll.kernel32.WaitForSingleObject(h, 0)
+            finally:
+                ctypes.windll.kernel32.CloseHandle(h)
+            return rc == WAIT_TIMEOUT
         except Exception:
             return False
     try:
@@ -796,10 +1119,16 @@ def _kill_pid(pid: int) -> None:
         return
     if sys.platform == "win32":
         try:
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
-                           capture_output=True, timeout=4)
-        except Exception:
-            pass
+            r = subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True, timeout=4)
+            if r.returncode not in (0, 128):
+                err = (r.stderr or b"").decode(errors="replace")[:200]
+                print(f"[fona] taskkill pid={pid} rc={r.returncode}: {err}",
+                      file=sys.stderr, flush=True)
+        except Exception as e:
+            print(f"[fona] taskkill pid={pid} failed: {e}",
+                  file=sys.stderr, flush=True)
     else:
         for sig in (15, 9):
             try:
@@ -807,7 +1136,9 @@ def _kill_pid(pid: int) -> None:
                 _t.sleep(0.3)
                 if not _is_pid_alive(pid):
                     return
-            except OSError:
+            except OSError as e:
+                print(f"[fona] kill pid={pid} sig={sig} failed: {e}",
+                      file=sys.stderr, flush=True)
                 return
 
 
@@ -853,76 +1184,48 @@ def _kill_python_on_port(port: int) -> Optional[int]:
     if not pid or not _is_pid_alive(pid):
         return None
     image = _get_process_image(pid)
-    if image and not image.startswith("python"):
+    if image and not image.lower().startswith("python"):
+        print(f"[fona] not killing pid={pid} on port {port}: "
+              f"image={image!r}", file=sys.stderr, flush=True)
         return None
-    print(f"[fona] killing stale pid={pid} on port {port}",
-          file=sys.stderr, flush=True)
+    print(f"[fona] killing stale pid={pid} on port {port} "
+          f"(image={image!r})", file=sys.stderr, flush=True)
     _kill_pid(pid)
+    _t.sleep(0.5)
+    if _is_pid_alive(pid):
+        print(f"[fona] pid={pid} still alive after taskkill; "
+              f"may need admin rights", file=sys.stderr, flush=True)
+        return None
     return pid
 
 
-def _kill_orphan_children() -> List[int]:
-    pid_map = _load_pid_map()
-    if not pid_map:
-        return []
-
-    killed: List[int] = []
-    seen: set = set()
-    for agent_id, info in pid_map.items():
-        pid = info.get("pid") or 0
-        port = info.get("port") or 0
-
-        if pid and _is_pid_alive(pid) and pid not in seen:
-            image = _get_process_image(pid)
-            if not image or image.startswith("python"):
-                print(f"[fona] killing orphan pid={pid} (agent {agent_id})",
-                      file=sys.stderr, flush=True)
-                _kill_pid(pid)
-                killed.append(pid)
-                seen.add(pid)
-
-        if port:
-            port_pid = _kill_python_on_port(port)
-            if port_pid and port_pid not in seen:
-                killed.append(port_pid)
-                seen.add(port_pid)
-
+def _kill_orphans_in_range(start: int, end: int,
+                           team_name: Optional[str]) -> int:
+    killed = 0
     try:
-        os.remove(_pid_file())
-    except OSError:
-        pass
+        live = scan_range(start, end)
+    except Exception as e:
+        print(f"[fona] orphan scan failed: {e}",
+              file=sys.stderr, flush=True)
+        return 0
+    for item in live:
+        if team_name and item.team_name == team_name:
+            continue
+        pid = item.pid
+        if not pid or not _is_pid_alive(pid):
+            continue
+        image = _get_process_image(pid)
+        if image and not image.lower().startswith("python"):
+            continue
+        _kill_pid(pid)
+        _t.sleep(0.2)
+        if not _is_pid_alive(pid):
+            killed += 1
+            _log_action("log_killed_orphan", pid=pid, port=item.port)
+            print(f"[fona] killed orphan pid={pid} on port {item.port} "
+                  f"(team={item.team_name!r}, name={item.name!r})",
+                  file=sys.stderr, flush=True)
     return killed
-
-
-# ============================================================================
-# Port detection helpers
-# ============================================================================
-def _is_port_free(port: int) -> bool:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        if sys.platform != "win32":
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            s.bind(("127.0.0.1", port))
-            return True
-        except OSError:
-            return False
-
-
-def _is_port_open(port: int) -> bool:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.settimeout(0.15)
-        try:
-            return s.connect_ex(("127.0.0.1", port)) == 0
-        except OSError:
-            return False
-
-
-def _health_ok(url: str, timeout: float = 1.0) -> bool:
-    try:
-        r = httpx.get(f"{url}/api/v1/health", timeout=timeout)
-        return r.status_code == 200
-    except Exception:
-        return False
 
 
 # ============================================================================
@@ -933,12 +1236,13 @@ class AgentEntry:
     id: str
     name: str
     script: str
-    port: int
+    port: int = 0
     url: str = ""
     process: Optional[subprocess.Popen] = None
     orchestrator_gradio_port: Optional[int] = None
     orchestrator_process: Optional[subprocess.Popen] = None
     orchestrator_template: Optional[str] = None
+    env: Dict[str, str] = field(default_factory=dict)
     status: str = "stopped"
     error: str = ""
     started_at: float = 0.0
@@ -950,13 +1254,13 @@ class AgentEntry:
     latency_ms: float = 0.0
     history: List[int] = field(default_factory=list)
     autostart: bool = False
-    # source tracking (only set when the script was copied)
     source: str = ""
     source_sha256: str = ""
     source_mtime: float = 0.0
+    adopted: bool = False
 
     def __post_init__(self):
-        if not self.url:
+        if self.port and not self.url:
             self.url = f"http://127.0.0.1:{self.port}"
 
     def uptime_seconds(self) -> float:
@@ -984,13 +1288,6 @@ def _sha256(path: str) -> str:
 
 
 def _install_script(src_path: str) -> Tuple[str, str]:
-    """Copy src_path into <project>/scripts/.
-
-    Returns (dest, status) where status is one of:
-      'same'    — identical content already present, no copy
-      'copied'  — copied under the same basename
-      'renamed' — copied as <stem>_<sha8>.py (different content, old kept)
-    """
     dest_dir = _agents_dir()
     basename = os.path.basename(src_path)
     stem, ext = os.path.splitext(basename)
@@ -1015,7 +1312,6 @@ def _install_script(src_path: str) -> Tuple[str, str]:
 
 
 def _agents_dir() -> str:
-    """Where uploaded/copied agent scripts live."""
     if _active_project is not None:
         path = _active_project.scripts_dir
     else:
@@ -1023,6 +1319,39 @@ def _agents_dir() -> str:
         path = os.path.join(here, "agents")
     os.makedirs(path, exist_ok=True)
     return path
+
+
+def _maybe_reload_team() -> bool:
+    """FIX EE: silently reload team.json when its mtime changes.
+
+    Replaces the removed "Load" button. Safe: load_team(start_flagged=
+    False) only updates entries by id, adopts live processes, does not
+    kill, does not start. Returns True if a reload happened.
+    """
+    if _active_project is None:
+        return False
+    path = _active_project.team_file
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return False
+    prev = _team_mtime_cache.get(path)
+    if prev is not None and abs(mtime - prev) < _RELOAD_EPS:
+        return False
+    _team_mtime_cache[path] = mtime
+    if prev is None:
+        # First observation after open: _open_after_load / _ensure_
+        # startup_project already ran load_team; nothing to do.
+        return False
+    try:
+        load_team(path, start_flagged=False)
+        _log_action("log_team_loaded", path=path,
+                    n=len(_manager.list()))
+        return True
+    except Exception as e:
+        print(f"[fona] auto-reload failed: {e}",
+              file=sys.stderr, flush=True)
+        return False
 
 
 def _file_to_path(f) -> Optional[str]:
@@ -1058,7 +1387,8 @@ def _pick_script_dialog() -> str:
         return ""
 
 
-def _pick_directory_dialog() -> str:
+def _pick_directory_dialog(title: str = "") -> str:
+    """FIX V: optional dialog title."""
     try:
         import tkinter as tk
         from tkinter import filedialog
@@ -1071,7 +1401,8 @@ def _pick_directory_dialog() -> str:
             root.attributes("-topmost", True)
         except Exception:
             pass
-        path = filedialog.askdirectory(title="Select project folder")
+        path = filedialog.askdirectory(
+            title=title or "Select project folder")
         root.destroy()
         return path or ""
     except Exception:
@@ -1079,7 +1410,6 @@ def _pick_directory_dialog() -> str:
 
 
 def _source_status(a: AgentEntry) -> str:
-    """Return '' if source is fine, else 'changed' or 'missing'."""
     if not a.source:
         return ""
     if not os.path.isfile(a.source):
@@ -1101,31 +1431,28 @@ class AgentManager:
         self.agents: Dict[str, AgentEntry] = {}
         self._lock = threading.RLock()
 
-    def add(self, script: str, name: str, port: int,
-            orch_port: Optional[int] = None,
-            orch_template: Optional[str] = None) -> AgentEntry:
-        if not (1 <= int(port) <= 65535):
-            raise ValueError(f"port must be 1..65535 (got {port})")
-        if orch_port is not None and not (1 <= int(orch_port) <= 65535):
-            raise ValueError("orchestrator port must be 1..65535")
+    def _check_port_collisions(self, port: int, orch_port: Optional[int],
+                               exclude_id: Optional[str] = None) -> None:
+        for a in self.agents.values():
+            if exclude_id is not None and a.id == exclude_id:
+                continue
+            if a.port == int(port):
+                raise ValueError(f"port {port} already used by {a.name}")
+            if (orch_port is not None
+                    and a.orchestrator_gradio_port == int(orch_port)):
+                raise ValueError(
+                    f"orchestrator port {orch_port} already used by {a.name}")
+
+    def add(self, script: str, name: str,
+            orch_template: Optional[str] = None,
+            env: Optional[Dict[str, str]] = None) -> AgentEntry:
         with self._lock:
-            for a in self.agents.values():
-                if a.port == int(port):
-                    raise ValueError(f"port {port} already used by {a.name}")
-                if (orch_port is not None
-                        and a.orchestrator_gradio_port == int(orch_port)):
-                    raise ValueError(
-                        f"orchestrator port {orch_port} already used by "
-                        f"{a.name}")
-            if _is_port_open(int(port)):
-                raise ValueError(f"port {port} is in use")
             entry = AgentEntry(
                 id=str(uuid.uuid4())[:8],
                 name=name or Path(script).stem,
-                script=script, port=int(port),
-                orchestrator_gradio_port=(
-                    int(orch_port) if orch_port else None),
+                script=script,
                 orchestrator_template=orch_template or None,
+                env=dict(env or {}),
             )
             self.agents[entry.id] = entry
             return entry
@@ -1135,9 +1462,6 @@ class AgentManager:
             a = self.agents.pop(agent_id, None)
         if a is not None:
             self._stop_process(a)
-            pid_map = _load_pid_map()
-            pid_map.pop(agent_id, None)
-            _save_pid_map(pid_map)
         return a
 
     def get(self, agent_id: str) -> Optional[AgentEntry]:
@@ -1147,30 +1471,6 @@ class AgentManager:
     def list(self) -> List[AgentEntry]:
         with self._lock:
             return list(self.agents.values())
-
-    def change_port(self, agent_id: str, new_port: int) -> None:
-        if not (1 <= int(new_port) <= 65535):
-            raise ValueError("port must be 1..65535")
-        a = self.get(agent_id)
-        if a is None or int(new_port) == a.port:
-            return
-        with self._lock:
-            for other in self.agents.values():
-                if other.id != agent_id and other.port == int(new_port):
-                    raise ValueError(
-                        f"port {new_port} already used by {other.name}")
-        if _is_port_open(int(new_port)):
-            raise ValueError(f"port {new_port} is in use")
-        was_running = a.is_alive()
-        if was_running:
-            self._stop_process(a)
-        a.port = int(new_port)
-        a.url = f"http://127.0.0.1:{a.port}"
-        a.status = "stopped"; a.error = ""; a.history = []
-        a.started_at = 0.0
-        a.first_poll_starting_at = 0.0
-        if was_running:
-            self.start(agent_id)
 
     def set_autostart(self, agent_id: str, value: bool) -> None:
         a = self.get(agent_id)
@@ -1183,6 +1483,29 @@ class AgentManager:
         if a is not None:
             a.orchestrator_template = path or None
 
+    def _allocate_for(self, exclude_id: Optional[str] = None,
+                      with_orch: bool = True) -> Tuple[int, int]:
+        if _active_project is None:
+            raise RuntimeError("no active project")
+        used: set = set()
+        for a in self.list():
+            if exclude_id is not None and a.id == exclude_id:
+                continue
+            if a.port:
+                used.add(a.port)
+            if a.orchestrator_gradio_port:
+                used.add(a.orchestrator_gradio_port)
+        start, end = _active_project.port_range
+        agent_port = _allocate_port(used, start, end)
+        used.add(agent_port)
+        orch_port = 0
+        if with_orch:
+            try:
+                orch_port = _allocate_port(used, start, end)
+            except RuntimeError:
+                orch_port = 0
+        return agent_port, orch_port
+
     def start(self, agent_id: str) -> None:
         a = self.get(agent_id)
         if a is None:
@@ -1193,66 +1516,84 @@ class AgentManager:
             msg = f"script not found: {a.script}"
             a.status = "error"
             a.error = msg
-            print(f"[fona] start failed for {a.name}: {msg}",
-                  file=sys.stderr, flush=True)
             _log_action("log_start_failed", name=a.name, reason=msg)
             return
         if a.process is not None and a.process.poll() is None:
             return
 
-        # ---- 1. Adopt or clear the port ----
-        deadline = _t.time() + 5.0
-        while _t.time() < deadline:
-            if _is_port_free(a.port):
-                break
-            if _health_ok(a.url, timeout=0.8):
-                adopted_pid = _find_pid_by_port(a.port) or 0
-                a.status = "online"
-                a.started_at = _t.time()
-                a.first_poll_starting_at = 0.0
-                a.error = ""
-                a.history = [1]
-                if adopted_pid:
-                    m = _load_pid_map()
-                    m[a.id] = {"pid": adopted_pid, "port": a.port}
-                    _save_pid_map(m)
-                print(f"[fona] {a.name}: adopted existing process on "
-                      f"port {a.port} (pid={adopted_pid})",
-                      file=sys.stderr, flush=True)
-                _log_action("log_adopted", name=a.name, port=a.port)
-                return
-            _t.sleep(0.5)
-
-        if not _is_port_free(a.port):
-            killed = _kill_python_on_port(a.port)
-            if killed:
-                _log_action("log_killed_stale", pid=killed, port=a.port)
-            for _ in range(20):
-                if _is_port_free(a.port):
-                    break
-                _t.sleep(0.1)
-
-        if not _is_port_free(a.port):
-            msg = (f"port {a.port} is still in use after cleanup "
-                   f"(waited ~5s)")
-            a.status = "error"
-            a.error = msg
-            print(f"[fona] start failed for {a.name}: {msg}",
+        if a.port and _health_ok(a.url, timeout=0.8):
+            adopted_pid = _find_pid_by_port(a.port) or 0
+            a.status = "online"
+            a.adopted = True
+            a.process = None
+            a.started_at = _t.time()
+            a.first_poll_starting_at = 0.0
+            a.error = ""
+            a.history = [1]
+            _log_action("log_adopted", name=a.name, port=a.port)
+            print(f"[fona] {a.name}: adopted existing process on "
+                  f"port {a.port} (pid={adopted_pid})",
                   file=sys.stderr, flush=True)
-            _log_action("log_start_failed", name=a.name, reason=msg)
             return
 
-        # ---- 2. Spawn a fresh child ----
-        env = _child_env(a.port)
+        with_orch = bool(a.orchestrator_template)
+        try:
+            agent_port, orch_port = self._allocate_for(
+                exclude_id=a.id, with_orch=with_orch)
+        except Exception as e:
+            a.status = "error"
+            a.error = str(e)
+            _log_action("log_start_failed", name=a.name, reason=a.error)
+            return
+
+        for _attempt in range(3):
+            stale = _find_pid_by_port(agent_port)
+            if not stale:
+                break
+            _kill_python_on_port(agent_port)
+            _t.sleep(0.3)
+        if not _is_port_free(agent_port):
+            try:
+                used = {x.port for x in self.list()
+                        if x.id != a.id and x.port}
+                used.add(agent_port)
+                start_r, end_r = _active_project.port_range
+                agent_port = _allocate_port(used, start_r, end_r)
+                _kill_python_on_port(agent_port)
+                _t.sleep(0.2)
+            except Exception as e:
+                a.status = "error"
+                a.error = f"port busy: {e}"
+                _log_action("log_start_failed", name=a.name,
+                            reason=a.error)
+                return
+
+        a.port = agent_port
+        a.url = f"http://127.0.0.1:{agent_port}"
+        a.orchestrator_gradio_port = orch_port or None
+
+        team_name = (_active_project.name
+                     if _active_project is not None else None)
+        team_file = (_active_project.team_file
+                     if _active_project is not None else None)
+        env = _child_env(
+            a.port,
+            agent_name=a.name,
+            team_name=team_name,
+            extra=a.env,
+            team_file=team_file,
+        )
+        if a.orchestrator_gradio_port:
+            env["FONA_ORCHESTRATOR_PORT"] = str(a.orchestrator_gradio_port)
+
         out_path = _out_log_path(a.id)
         err_path = _err_log_path(a.id)
         for p in (out_path, err_path):
             try:
                 if os.path.isfile(p):
                     os.remove(p)
-            except OSError as e:
-                print(f"[fona] cannot remove {p}: {e}",
-                      file=sys.stderr, flush=True)
+            except OSError:
+                pass
 
         exe = sys.executable
         if exe.lower().endswith("pythonw.exe"):
@@ -1265,7 +1606,6 @@ class AgentManager:
             if sys.platform == "win32":
                 kwargs["creationflags"] = (
                     subprocess.CREATE_NEW_PROCESS_GROUP | 0x08000000)
-
             outf = open(out_path, "wb")
             errf = open(err_path, "wb")
             try:
@@ -1283,97 +1623,65 @@ class AgentManager:
             a.started_at = _t.time()
             a.first_poll_starting_at = 0.0
             a.status = "starting"
+            a.adopted = False
             a.error = ""
             a.history = []
-            pid_map = _load_pid_map()
-            pid_map[a.id] = {"pid": a.process.pid, "port": a.port}
-            _save_pid_map(pid_map)
             print(f"[fona] started {a.name} pid={a.process.pid} "
-                  f"port={a.port} script={a.script} "
-                  f"PYTHONPATH={env.get('PYTHONPATH', '')}",
+                  f"port={a.port} orch_port={a.orchestrator_gradio_port} "
+                  f"script={a.script}",
                   file=sys.stderr, flush=True)
         except Exception as e:
             a.status = "error"
             a.error = f"{type(e).__name__}: {e}"
-            print(f"[fona] Popen failed for {a.name}: {a.error}",
-                  file=sys.stderr, flush=True)
             _log_action("log_start_failed", name=a.name, reason=a.error)
             return
 
-        # ---- 3. Orchestrator UI (optional) ----
-        if a.orchestrator_gradio_port and a.orchestrator_process is None:
-            if (a.orchestrator_template
-                    and not os.path.isfile(a.orchestrator_template)):
-                msg = t("en", "orch_template_missing",
-                        path=a.orchestrator_template)
-                a.error = msg
-                _log_action("log_orch_template_missing",
-                            name=a.name, path=a.orchestrator_template)
-                print(f"[fona] {a.name}: {msg}",
-                      file=sys.stderr, flush=True)
-            else:
-                try:
-                    okwargs = {}
-                    if sys.platform == "win32":
-                        okwargs["creationflags"] = 0x08000000
-                    o_out = open(
-                        os.path.join(_logs_dir(),
-                                     f"{a.id}.orch.out.log"), "wb")
-                    o_err = open(
-                        os.path.join(_logs_dir(),
-                                     f"{a.id}.orch.err.log"), "wb")
-                    try:
-                        cmd = [exe, "-u", "-m", "fona.orchestrator_app",
-                               "--orchestrator", a.url,
-                               "--port", str(a.orchestrator_gradio_port),
-                               "--no-browser"]
-                        if a.orchestrator_template:
-                            cmd += ["--template", a.orchestrator_template]
-                        a.orchestrator_process = subprocess.Popen(
-                            cmd,
-                            env={**os.environ, "FONA_CHILD": "1"},
-                            stdout=o_out, stderr=o_err, **okwargs,
-                        )
-                    finally:
-                        o_out.close()
-                        o_err.close()
-                except Exception as e:
-                    a.error = f"orchestrator spawn failed: {e}"
-                    print(f"[fona] orchestrator spawn failed for "
-                          f"{a.name}: {e}",
-                          file=sys.stderr, flush=True)
+        for delay in (0.3, 0.7, 1.0):
+            _t.sleep(delay)
+            if a.process is None:
+                break
+            if a.process.poll() is not None:
+                rc = a.process.returncode
+                out_tail, err_tail = _read_both_logs(a.id, 400)
+                compact = (err_tail or out_tail or "").strip()[:300]
+                a.status = "error"
+                a.error = f"child exited immediately rc={rc}: {compact}"
+                _log_action("log_child_died",
+                            name=a.name, rc=rc, tail=compact)
+                return
 
     def stop(self, agent_id: str) -> None:
         a = self.get(agent_id)
         if a is None:
             return
+        if a.adopted:
+            _do_not_adopt.add(a.id)
+            pid = _find_pid_by_port(a.port) or 0
+            a.adopted = False
+            a.process = None
+            a.status = "stopped"
+            a.started_at = 0.0
+            a.first_poll_starting_at = 0.0
+            _log_action("log_released", name=a.name, port=a.port)
+            print(f"[fona] {a.name}: released adopted pid={pid} on port "
+                  f"{a.port} (not killed)", file=sys.stderr, flush=True)
+            return
+        self._stop_process(a)
+        a.status = "stopped"
+        a.started_at = 0.0
+        a.first_poll_starting_at = 0.0
 
-        if a.process is not None:
-            self._stop_process(a)
-        else:
-            pid_map = _load_pid_map()
-            info = pid_map.get(agent_id) or {}
-            pid = info.get("pid") or 0
-            if not pid:
-                pid = _find_pid_by_port(a.port) or 0
-            if pid and _is_pid_alive(pid):
-                image = _get_process_image(pid)
-                if not image or image.startswith("python"):
-                    print(f"[fona] stopping adopted pid={pid} "
-                          f"(agent {agent_id})",
-                          file=sys.stderr, flush=True)
-                    _kill_pid(pid)
-
-        for _ in range(20):
-            if _is_port_free(a.port):
-                break
-            _kill_python_on_port(a.port)
-            _t.sleep(0.1)
-
-        pid_map = _load_pid_map()
-        pid_map.pop(agent_id, None)
-        _save_pid_map(pid_map)
-
+    def kill(self, agent_id: str) -> None:
+        a = self.get(agent_id)
+        if a is None:
+            return
+        pid = _find_pid_by_port(a.port) or 0
+        if pid and _is_pid_alive(pid):
+            image = _get_process_image(pid)
+            if not image or image.lower().startswith("python"):
+                _kill_pid(pid)
+        a.process = None
+        a.adopted = False
         a.status = "stopped"
         a.started_at = 0.0
         a.first_poll_starting_at = 0.0
@@ -1431,28 +1739,6 @@ class AgentManager:
         if a.process is not None and a.process.poll() is not None:
             rc = a.process.returncode
             a.process = None
-
-            deadline = _t.time() + 2.0
-            while _t.time() < deadline:
-                if _health_ok(a.url, timeout=0.5):
-                    adopted_pid = _find_pid_by_port(a.port) or 0
-                    a.status = "online"
-                    a.started_at = _t.time()
-                    a.first_poll_starting_at = 0.0
-                    a.error = ""
-                    if adopted_pid:
-                        m = _load_pid_map()
-                        m[a.id] = {"pid": adopted_pid, "port": a.port}
-                        _save_pid_map(m)
-                    print(f"[fona] {a.name}: child exited rc={rc} but "
-                          f"port {a.port} is serving (pid={adopted_pid}); "
-                          f"adopted", file=sys.stderr, flush=True)
-                    _log_action("log_recovered", name=a.name, port=a.port)
-                    a.history.append(1)
-                    a.history = a.history[-40:]
-                    return a
-                _t.sleep(0.2)
-
             if rc not in (0, None):
                 out_tail, err_tail = _read_both_logs(a.id, 800)
                 combined = (err_tail or out_tail or "").strip()
@@ -1463,11 +1749,12 @@ class AgentManager:
                 a.status = "error"
                 a.error = (f"exit {rc}: {compact[:400]}" if compact
                            else f"process exited with code {rc}")
-                print(f"[fona] {a.name} exited rc={rc}: "
-                      f"{compact[:300]}", file=sys.stderr, flush=True)
                 a.history.append(0)
                 a.history = a.history[-40:]
                 return a
+
+        if not a.port:
+            return a
 
         t0 = _t.time()
         ok = _health_ok(a.url, timeout=1.0)
@@ -1483,24 +1770,36 @@ class AgentManager:
                     ok = True
                     a.error = (f"port auto-corrected: {old_port} \u2192 "
                                f"{detected} (script ignores FONA_PORT)")
-                    print(f"[fona] {a.name}: port auto-corrected "
-                          f"{old_port} -> {detected}",
-                          file=sys.stderr, flush=True)
 
         if ok:
-            a.status = "online"
-            a.first_poll_starting_at = 0.0
-            if not a.error.startswith("port auto-corrected"):
-                a.error = ""
-            try:
-                mr = httpx.get(f"{a.url}/api/v1/model", timeout=1.0)
-                if mr.status_code == 200:
-                    m = mr.json()
-                    a.rules = int(m.get("rules_count", 0))
-                    a.actions = len(m.get("actions", []))
-                    a.kb_file = m.get("kb_file") or ""
-            except Exception:
-                pass
+            if (a.process is not None
+                    and not a.adopted
+                    and os.environ.get("FONA_STRICT_PID") == "1"):
+                serving_pid = _health_pid(a.url)
+                if (serving_pid is not None
+                        and serving_pid != a.process.pid):
+                    ok = False
+                    a.status = "error"
+                    a.error = (f"port {a.port} serves pid={serving_pid}, "
+                               f"expected {a.process.pid}; "
+                               f"press Start to retry")
+                    _log_action("log_pid_mismatch", name=a.name,
+                                port=a.port)
+                    a.first_poll_starting_at = 0.0
+            if ok:
+                a.status = "online"
+                a.first_poll_starting_at = 0.0
+                if not a.error.startswith("port auto-corrected"):
+                    a.error = ""
+                try:
+                    mr = httpx.get(f"{a.url}/api/v1/model", timeout=1.0)
+                    if mr.status_code == 200:
+                        m = mr.json()
+                        a.rules = int(m.get("rules_count", 0))
+                        a.actions = len(m.get("actions", []))
+                        a.kb_file = m.get("kb_file") or ""
+                except Exception:
+                    pass
         else:
             if a.status == "online":
                 a.status = "offline"
@@ -1508,25 +1807,9 @@ class AgentManager:
             elif a.status == "starting":
                 if a.first_poll_starting_at == 0.0:
                     a.first_poll_starting_at = _t.time()
-                elapsed = _t.time() - a.first_poll_starting_at
-                if elapsed > 25.0:
+                if _t.time() - a.first_poll_starting_at > 25.0:
                     a.status = "error"
-                    child_alive = (a.process is not None
-                                   and a.process.poll() is None)
-                    listener_pid = _find_pid_by_port(a.port) or 0
-                    out_tail, err_tail = _read_both_logs(a.id, 400)
-                    combined = (err_tail or out_tail or "").strip()
-                    compact = " | ".join(
-                        line.strip() for line in combined.splitlines()
-                        if line.strip()
-                    ) if combined else ""
-                    diag = (f"child_alive={child_alive}, "
-                            f"listener_pid={listener_pid}")
-                    a.error = (f"no response > 25s ({diag}): "
-                               f"{compact[:300]}" if compact
-                               else f"no response > 25s ({diag})")
-                    print(f"[fona] {a.name}: {a.error}",
-                          file=sys.stderr, flush=True)
+                    a.error = "no response > 25s"
 
         a.history.append(1 if ok else 0)
         a.history = a.history[-40:]
@@ -1537,11 +1820,8 @@ _manager = AgentManager()
 
 
 # ============================================================================
-# Team save/load (project-aware, version 2)
+# Team save/load (v4)
 # ============================================================================
-TEAM_VERSION = 2
-
-
 def _agent_to_dict(a: AgentEntry, base_dir: str) -> dict:
     def rel(p: str) -> str:
         if not p:
@@ -1554,8 +1834,7 @@ def _agent_to_dict(a: AgentEntry, base_dir: str) -> dict:
     d = {
         "id": a.id, "name": a.name,
         "script": rel(a.script),
-        "port": a.port, "autostart": a.autostart,
-        "orchestrator_gradio_port": a.orchestrator_gradio_port,
+        "autostart": a.autostart,
     }
     if a.source:
         d["source"] = rel(a.source)
@@ -1563,6 +1842,8 @@ def _agent_to_dict(a: AgentEntry, base_dir: str) -> dict:
         d["source_mtime"] = a.source_mtime
     if a.orchestrator_template:
         d["orchestrator_template"] = rel(a.orchestrator_template)
+    if a.env:
+        d["env"] = dict(a.env)
     return d
 
 
@@ -1578,18 +1859,19 @@ def _dict_to_agent(d: dict, base_dir: str) -> AgentEntry:
     orch_template = (
         abspath_or_rel(d["orchestrator_template"])
         if d.get("orchestrator_template") else None)
+    env = d.get("env")
+    if not isinstance(env, dict):
+        env = {}
     return AgentEntry(
         id=d.get("id") or str(uuid.uuid4())[:8],
         name=d.get("name") or Path(script).stem,
-        script=script, port=int(d.get("port") or 8000),
+        script=script,
         autostart=bool(d.get("autostart", False)),
-        orchestrator_gradio_port=(
-            int(d["orchestrator_gradio_port"])
-            if d.get("orchestrator_gradio_port") else None),
         source=source,
         source_sha256=d.get("source_sha256", ""),
         source_mtime=float(d.get("source_mtime") or 0.0),
         orchestrator_template=orch_template,
+        env={str(k): str(v) for k, v in env.items()},
     )
 
 
@@ -1601,6 +1883,7 @@ def save_team(_unused_name: str = "") -> str:
     payload = {
         "version": TEAM_VERSION,
         "name": project.name,
+        "port_range": list(project.port_range),
         "saved_at": _dt.datetime.now().isoformat(timespec="seconds"),
         "agents": [_agent_to_dict(a, project.root)
                    for a in _manager.list()],
@@ -1610,19 +1893,61 @@ def save_team(_unused_name: str = "") -> str:
     return project.team_file
 
 
-def load_team(path: str, *, start_flagged: bool = False
-              ) -> Tuple[int, int]:
+def _scan_and_adopt(project: Project,
+                    known: Dict[str, dict]) -> Dict[str, AgentEntry]:
+    adopted: Dict[str, AgentEntry] = {}
+    try:
+        live = scan_range(*project.port_range)
+    except Exception:
+        live = []
+    for item in live:
+        name = item.name
+        team = item.team_name
+        if team != project.name:
+            continue
+        if not name or name not in known:
+            continue
+        if name in adopted:
+            print(f"[fona] adoption: duplicate name {name!r} on port "
+                  f"{item.port}; already adopted on "
+                  f"{adopted[name].port}; skipping",
+                  file=sys.stderr, flush=True)
+            continue
+        if known[name].get("id") in _do_not_adopt:
+            continue
+        adopted[name] = AgentEntry(
+            id=known[name].get("id") or str(uuid.uuid4())[:8],
+            name=name,
+            script=known[name]["script"],
+            port=item.port, url=item.url,
+            status="online",
+            adopted=True,
+            autostart=bool(known[name].get("autostart")),
+            orchestrator_template=known[name].get("orchestrator_template"),
+            env=dict(known[name].get("env") or {}),
+            source=known[name].get("source", ""),
+            source_sha256=known[name].get("source_sha256", ""),
+            source_mtime=float(known[name].get("source_mtime") or 0.0),
+        )
+        print(f"[fona] adoption: {name!r} (team={team!r}) on port "
+              f"{item.port}", file=sys.stderr, flush=True)
+    return adopted
+
+
+def load_team(path: str, *, start_flagged: bool = False,
+              force_start: bool = False) -> Tuple[int, int]:
     if not os.path.isfile(path):
         raise FileNotFoundError(path)
     with open(path, "r", encoding="utf-8") as f:
         payload = _json.load(f)
     version = payload.get("version")
-    if version not in (1, 2):
+    if version not in (1, 2, 3, 4):
         raise ValueError(f"unsupported team version: {version}")
 
     base_dir = os.path.dirname(path)
     loaded = 0
     flagged_ids: List[str] = []
+    known: Dict[str, dict] = {}
 
     with _manager._lock:
         for d in payload.get("agents", []):
@@ -1634,35 +1959,79 @@ def load_team(path: str, *, start_flagged: bool = False
                 _log_action("log_script_missing",
                             name=entry.name, path=entry.script)
                 continue
+            known[entry.name] = {
+                "id": entry.id,
+                "script": entry.script,
+                "autostart": entry.autostart,
+                "orchestrator_template": entry.orchestrator_template,
+                "env": entry.env,
+                "source": entry.source,
+                "source_sha256": entry.source_sha256,
+                "source_mtime": entry.source_mtime,
+            }
             existing = _manager.agents.get(entry.id)
             if existing is not None:
+                was_adopted = existing.adopted
+                was_port = existing.port
                 existing.name = entry.name
                 existing.script = entry.script
+                existing.autostart = entry.autostart
+                existing.orchestrator_template = \
+                    entry.orchestrator_template
+                existing.env = dict(entry.env)
                 existing.source = entry.source
                 existing.source_sha256 = entry.source_sha256
                 existing.source_mtime = entry.source_mtime
-                existing.autostart = entry.autostart
-                existing.orchestrator_gradio_port = \
-                    entry.orchestrator_gradio_port
-                existing.orchestrator_template = \
-                    entry.orchestrator_template
-                if (existing.port != entry.port
-                        and _is_port_free(entry.port)):
-                    if existing.is_alive():
-                        _manager._stop_process(existing)
-                    existing.port = entry.port
-                    existing.url = f"http://127.0.0.1:{entry.port}"
-                    existing.status = "stopped"
-                    existing.first_poll_starting_at = 0.0
+                if was_adopted:
+                    if was_port and _health_ok(
+                            f"http://127.0.0.1:{was_port}", timeout=0.6):
+                        existing.adopted = True
+                        existing.process = None
+                        existing.status = "online"
+                        existing.port = was_port
+                        existing.url = f"http://127.0.0.1:{was_port}"
+                    else:
+                        existing.adopted = False
+                        existing.process = None
+                        existing.status = "stopped"
+                        existing.error = ""
+                        existing.started_at = 0.0
+                        existing.first_poll_starting_at = 0.0
+                else:
+                    existing.adopted = False
             else:
                 _manager.agents[entry.id] = entry
                 loaded += 1
             if entry.autostart:
                 flagged_ids.append(entry.id)
 
+    if _active_project is not None:
+        adopted = _scan_and_adopt(_active_project, known)
+        for name, entry in adopted.items():
+            existing = _manager.agents.get(entry.id)
+            if existing is not None:
+                existing.port = entry.port
+                existing.url = entry.url
+                existing.status = "online"
+                existing.adopted = True
+                existing.process = None
+                existing.started_at = _t.time()
+                existing.error = ""
+                existing.history = [1]
+            else:
+                _manager.agents[entry.id] = entry
+                loaded += 1
+
     started = 0
     if start_flagged:
-        for aid in flagged_ids:
+        if force_start:
+            to_start = [a.id for a in _manager.list()]
+        else:
+            to_start = list(flagged_ids)
+        for aid in to_start:
+            a = _manager.get(aid)
+            if a is None or (a.status == "online" and a.adopted):
+                continue
             _manager.start(aid)
             started += 1
     return loaded, started
@@ -1701,22 +2070,6 @@ def _sparkline(history: List[int]) -> str:
     )
 
 
-def _source_badge(a: AgentEntry, lang: str) -> str:
-    st = _source_status(a)
-    if not st:
-        return ""
-    label = t(lang, "source_changed" if st == "changed"
-              else "source_missing")
-    if st == "changed":
-        return (
-            f'<a class="update-btn" '
-            f'href="javascript:dashAction('
-            f"'/dashboard/update_source?id={a.id}')"
-            f'" title="{_esc(label)}">\u26a0 {_esc(label)}</a>'
-        )
-    return f'<span class="badge source-warn">\u26a0 {_esc(label)}</span>'
-
-
 def _card_html(a: AgentEntry, lang: str) -> str:
     status_key = {
         "online": "online", "offline": "offline",
@@ -1724,6 +2077,11 @@ def _card_html(a: AgentEntry, lang: str) -> str:
         "error": "error_status",
     }.get(a.status, "stopped")
     badge_text = t(lang, status_key)
+    card_class = a.status
+    if a.adopted:
+        card_class = "adopted"
+        badge_text = t(lang, "adopted_badge")
+
     open_html = (
         f'<a class="open-btn" href="{_esc(a.url)}" target="_blank" '
         f'rel="noopener">{t(lang, "open_ui")} \u2197</a>'
@@ -1732,12 +2090,12 @@ def _card_html(a: AgentEntry, lang: str) -> str:
         f'style="opacity:.4">{t(lang, "open_ui")}</button>'
     )
     orch_html = ""
-    if a.orchestrator_gradio_port and a.status == "online":
-        orch_url = f"http://127.0.0.1:{a.orchestrator_gradio_port}/"
+    if a.orchestrator_template and a.orchestrator_gradio_port:
         orch_html = (
-            f'<a class="open-btn orch" href="{_esc(orch_url)}" '
+            f'<a class="open-btn orch" '
+            f'href="http://127.0.0.1:{a.orchestrator_gradio_port}" '
             f'target="_blank" rel="noopener">'
-            f'\U0001f39b {t(lang, "open_orchestrator")} \u2197</a>'
+            f'{t(lang, "open_orchestrator")} \u2197</a>'
         )
     logs_html = (
         f'<a class="logs-btn" href="/dashboard/logs?id={a.id}&kind=err" '
@@ -1785,18 +2143,16 @@ def _card_html(a: AgentEntry, lang: str) -> str:
     ratio = (f"{sum(a.history[-20:])}/{len(a.history[-20:])}"
              if a.history else "\u2014")
     autostart_checked = "checked" if a.autostart else ""
-    prompt_text = t(lang, "change_port_prompt",
-                    name=a.name, current=a.port)
     confirm_text = t(lang, "confirm_remove", name=a.name)
 
     return f"""
-<div class="card {a.status}">
+<div class="card {card_class}">
   <div class="card-head">
     <div>
       <div class="card-title">{_esc(a.name)}</div>
-      <div class="card-sub">{_esc(a.url)}</div>
+      <div class="card-sub">{_esc(a.url or '—')}</div>
     </div>
-    <span class="badge {a.status}">{badge_text}</span>
+    <span class="badge {card_class}">{badge_text}</span>
   </div>
   <div class="card-body">
     <div class="kv"><span class="k">{t(lang, "uptime")}</span>
@@ -1832,16 +2188,13 @@ def _card_html(a: AgentEntry, lang: str) -> str:
       \u21bb
     </button>
     <button class="compact-btn"
-            onclick="var p=prompt(&quot;{_esc(prompt_text)}&quot;,&quot;{a.port}&quot;); if(!p) return; dashAction('/dashboard/change_port?id={a.id}&port='+encodeURIComponent(p.trim()));">
-      \u2699 {a.port}
-    </button>
-    <button class="compact-btn"
             onclick="dashAction('/dashboard/remove?id={a.id}', {{confirm: &quot;{_esc(confirm_text)}&quot;}})">
       \U0001f5d1
     </button>
-    <label class="compact-lbl" style="display:flex;align-items:center;gap:4px;">
+    <label class="compact-lbl" style="display:flex;align-items:center;gap:4px;"
+           title="{t(lang, 'autostart_hint')}">
       <input type="checkbox" {autostart_checked}
-             onchange="fetch('/dashboard/autostart?id={a.id}&value='+(this.checked?1:0),{{method:'POST'}})">
+             onchange="fetch('/dashboard/autostart?id={a.id}&value='+(this.checked?1:0),{{method:'POST'}}).then(function(){{window.fonaRefresh();}})">
       {t(lang, "autostart")}
     </label>
   </div>
@@ -1907,12 +2260,67 @@ def _status_dict(lang: str) -> dict:
     }
 
 
+def _render_live_tab(live: List[LiveAgent], lang: str) -> str:
+    if not live:
+        return (
+            f'<div class="empty-state">'
+            f'{t(lang, "no_live_agents")}</div>'
+        )
+    current_team = (_active_project.name
+                    if _active_project is not None else None)
+    rows = []
+    for item in live:
+        if item.error and not item.name:
+            status = "error"
+            status_label = t(lang, "error_status")
+            name = "?"
+            team = item.team_name or "—"
+        else:
+            status = "online"
+            status_label = t(lang, "online")
+            name = item.name or "?"
+            team = item.team_name or "—"
+        team_cls = (" team-ours" if (current_team and
+                                     item.team_name == current_team) else "")
+        pid = item.pid or 0
+        rows.append(f"""
+<div class="live-row {status}">
+  <div class="live-cell live-team{team_cls}">{_esc(team)}</div>
+  <div class="live-cell live-name"><b>{_esc(name)}</b></div>
+  <div class="live-cell live-port">{item.port}</div>
+  <div class="live-cell live-pid">{pid}</div>
+  <div class="live-cell live-status">
+    <span class="badge {status}">{status_label}</span>
+  </div>
+  <div class="live-cell live-actions">
+    <a class="open-btn" href="{_esc(item.url)}" target="_blank"
+       rel="noopener">{t(lang, "open_ui")} \u2197</a>
+    <button class="compact-btn"
+            onclick="dashAction('/dashboard/kill_live?port={item.port}',
+                     {{confirm: 'Kill pid {pid} on port {item.port}?'}})">
+      \U0001f5d1 {t(lang, "kill")}
+    </button>
+  </div>
+</div>
+""")
+    header = (
+        f'<div class="live-header">'
+        f'<div class="live-cell live-team">{t(lang, "team_col")}</div>'
+        f'<div class="live-cell live-name">{t(lang, "name_col")}</div>'
+        f'<div class="live-cell live-port">{t(lang, "port_col")}</div>'
+        f'<div class="live-cell live-pid">PID</div>'
+        f'<div class="live-cell live-status">{t(lang, "status_col")}</div>'
+        f'<div class="live-cell live-actions">{t(lang, "actions_col")}</div>'
+        f'</div>'
+    )
+    return f'<div class="live-table">{header}{"".join(rows)}</div>'
+
+
 # ============================================================================
 # HTTP endpoints
 # ============================================================================
 def _attach_dashboard_routes(app):
 
-    # ---------------- Project ----------------
     @app.get("/dashboard/project")
     async def dash_project_get():
         if _active_project is None:
@@ -1922,6 +2330,7 @@ def _attach_dashboard_routes(app):
             "root": _active_project.root,
             "name": _active_project.name,
             "team_file": _active_project.team_file,
+            "port_range": list(_active_project.port_range),
             "agents_count": len(_manager.list()),
         }
 
@@ -1930,16 +2339,26 @@ def _attach_dashboard_routes(app):
         body = await request.json()
         root = (body.get("root") or "").strip()
         name = (body.get("name") or "").strip()
+        pr = body.get("port_range")
         if not root:
             return {"status": "error", "error": "root is required"}
+        try:
+            if isinstance(pr, (list, tuple)) and len(pr) == 2:
+                port_range = (int(pr[0]), int(pr[1]))
+            else:
+                port_range = DEFAULT_PORT_RANGE
+        except Exception:
+            port_range = DEFAULT_PORT_RANGE
         try:
             global _active_project
             _manager.stop_all()
             _manager.agents.clear()
-            _active_project = Project.create(root, name)
+            _do_not_adopt.clear()
+            _active_project = Project.create(root, name, port_range)
             _log_action("log_project_created", path=_active_project.root)
             return {"status": "ok", "root": _active_project.root,
-                    "name": _active_project.name}
+                    "name": _active_project.name,
+                    "port_range": list(_active_project.port_range)}
         except Exception as e:
             return {"status": "error", "error": str(e)}
 
@@ -1949,16 +2368,24 @@ def _attach_dashboard_routes(app):
         root = (body.get("root") or "").strip()
         try:
             global _active_project
-            project = Project.open(root)
-            _manager.stop_all()
-            _manager.agents.clear()
+            project = Project.from_folder(root)
             _active_project = project
-            _kill_orphan_children()
+            try:
+                killed = _kill_orphans_in_range(
+                    project.port_range[0], project.port_range[1],
+                    team_name=project.name)
+                if killed:
+                    _log_action("log_orphans_cleaned", n=killed)
+            except Exception as e:
+                print(f"[fona] orphan cleanup failed: {e}",
+                      file=sys.stderr, flush=True)
+
             loaded, _ = load_team(project.team_file, start_flagged=False)
             _log_action("log_project_opened",
                         path=project.root, n=loaded)
             return {"status": "ok", "root": project.root,
-                    "name": project.name, "loaded": loaded}
+                    "name": project.name, "loaded": loaded,
+                    "port_range": list(project.port_range)}
         except Exception as e:
             return {"status": "error", "error": str(e)}
 
@@ -1968,20 +2395,21 @@ def _attach_dashboard_routes(app):
         _manager.stop_all()
         _manager.agents.clear()
         _active_project = None
+        _do_not_adopt.clear()
         return {"status": "ok"}
 
-    # ---------------- Agent lifecycle ----------------
     @app.post("/dashboard/start")
     async def dash_start(request: Request):
         aid = request.query_params.get("id")
         _manager.start(aid)
         a = _manager.get(aid)
         if a is not None and a.status != "error":
-            _log_action("log_started", name=a.name)
+            _log_action("log_started", name=a.name, port=a.port)
         elif a is not None:
             _log_action("log_start_failed", name=a.name, reason=a.error)
         return {"status": "ok",
                 "status_after": a.status if a else None,
+                "port": a.port if a else None,
                 "error": a.error if a else None}
 
     @app.post("/dashboard/stop")
@@ -2010,18 +2438,36 @@ def _attach_dashboard_routes(app):
             _log_action("log_removed", name=a.name)
         return {"status": "ok"}
 
-    @app.post("/dashboard/change_port")
-    async def dash_change_port(request: Request):
+    @app.post("/dashboard/release")
+    async def dash_release(request: Request):
+        aid = request.query_params.get("id")
+        a = _manager.get(aid)
+        if a is None:
+            return {"status": "error", "error": "not found"}
+        _do_not_adopt.add(aid)
+        a.adopted = False
+        a.process = None
+        a.status = "stopped"
+        a.started_at = 0.0
+        a.first_poll_starting_at = 0.0
+        return {"status": "ok"}
+
+    @app.post("/dashboard/kill_live")
+    async def dash_kill_live(request: Request):
         try:
-            aid = request.query_params.get("id")
-            new_port = int(request.query_params.get("port"))
-            a = _manager.get(aid)
-            _manager.change_port(aid, new_port)
-            if a is not None:
-                _log_action("log_port_changed", name=a.name, port=new_port)
-            return {"status": "ok"}
-        except Exception as e:
-            return {"status": "error", "error": str(e)}
+            port = int(request.query_params.get("port"))
+        except (TypeError, ValueError):
+            return {"status": "error", "error": "port required"}
+        pid = _find_pid_by_port(port)
+        if not pid:
+            return {"status": "error", "error": "no listener"}
+        image = _get_process_image(pid)
+        if image and not image.lower().startswith("python"):
+            return {"status": "error",
+                    "error": f"not a python process: {image}"}
+        _kill_pid(pid)
+        _log_action("log_killed_live", pid=pid, port=port)
+        return {"status": "ok", "pid": pid, "port": port}
 
     @app.post("/dashboard/autostart")
     async def dash_autostart(request: Request):
@@ -2036,7 +2482,6 @@ def _attach_dashboard_routes(app):
         _manager.set_orchestrator_template(aid, path)
         return {"status": "ok"}
 
-    # ---------------- Source update ----------------
     @app.post("/dashboard/update_source")
     async def dash_update_source(request: Request):
         aid = request.query_params.get("id")
@@ -2058,7 +2503,6 @@ def _attach_dashboard_routes(app):
         except Exception as e:
             return {"status": "error", "error": str(e)}
 
-    # ---------------- Logs / env / project info ----------------
     @app.get("/dashboard/logs")
     async def dash_logs(id: str, kind: str = "err", tail: int = 20000):
         path = _out_log_path(id) if kind == "out" else _err_log_path(id)
@@ -2076,17 +2520,18 @@ def _attach_dashboard_routes(app):
             "pythonpath": os.environ.get("PYTHONPATH", ""),
             "logs_dir": _logs_dir(),
             "scripts_dir": _agents_dir(),
-            "pid_file": _pid_file(),
-            "children": _load_pid_map(),
             "web_concurrency": os.environ.get("WEB_CONCURRENCY"),
+            "uvicorn_reload": os.environ.get("UVICORN_RELOAD"),
+            "strict_pid": os.environ.get("FONA_STRICT_PID"),
             "project": (
                 {"root": _active_project.root,
                  "name": _active_project.name,
-                 "team_file": _active_project.team_file}
+                 "team_file": _active_project.team_file,
+                 "port_range": list(_active_project.port_range)}
                 if _active_project is not None else None),
+            "autodetected_teams": _autodetect_team_files(),
         }
 
-    # ---------------- Save / load team ----------------
     @app.post("/dashboard/teams/save")
     async def dash_team_save(request: Request):
         if _active_project is None:
@@ -2108,8 +2553,11 @@ def _attach_dashboard_routes(app):
         try:
             start_flagged = bool(body.get(
                 "start_flagged", body.get("autostart", False)))
+            force_start = bool(body.get("force_start", start_flagged))
             path = _active_project.team_file
-            loaded, started = load_team(path, start_flagged=start_flagged)
+            loaded, started = load_team(
+                path, start_flagged=start_flagged,
+                force_start=force_start)
             if start_flagged:
                 _log_action("log_team_loaded_started",
                             path=path, n=loaded, started=started)
@@ -2142,37 +2590,39 @@ def build_ui() -> gr.Blocks:
         with gr.Row(equal_height=False):
 
             with gr.Column(scale=2, min_width=340):
-                # ---------------- Project ----------------
+                # ---------------- Project (FIX X/Y) ----------------
                 gr.HTML(f'<div class="col-head">\U0001f4c1 '
                         f'{t(lang, "project")}</div>')
-                with gr.Row(equal_height=True):
-                    project_path = gr.Textbox(
-                        placeholder=t(lang, "project_path_placeholder"),
-                        show_label=False, scale=4,
-                        elem_classes=["compact-tb"])
-                    project_browse = gr.Button(
-                        "\U0001f4c2", size="sm", scale=0, min_width=0,
-                        elem_classes=["compact-btn"])
-                with gr.Row(equal_height=True):
-                    project_name = gr.Textbox(
-                        placeholder=t(lang, "project_name_placeholder"),
-                        show_label=False, scale=2,
-                        elem_classes=["compact-tb"])
-                    project_create_btn = gr.Button(
-                        f"\u2795 {t(lang, 'project_create')}",
-                        size="sm", variant="primary", scale=1,
-                        elem_classes=["compact-btn"])
+                # FIX DD: three equal-width buttons in one row.
+                # equal_height=False disables the flex-wrap that Gradio 5
+                # applies to the inner .flex of a Row when equal_height
+                # is True — that wrap is what pushed "Close" onto a new
+                # line. min_width=0 lets the three buttons share width
+                # equally (scale=1 each).
+                with gr.Row(equal_height=False):
                     project_open_btn = gr.Button(
-                        f"\U0001f4c2 {t(lang, 'project_open')}",
-                        size="sm", scale=1,
+                        f"\U0001f4c2 {t(lang, 'project_open_btn')}",
+                        size="sm", variant="primary",
+                        scale=1, min_width=0,
+                        elem_classes=["compact-btn"])
+                    project_create_btn = gr.Button(
+                        f"\u2795 {t(lang, 'project_create_btn')}",
+                        size="sm",
+                        scale=1, min_width=0,
+                        elem_classes=["compact-btn"])
+                    project_close_btn = gr.Button(
+                        f"\u2716 {t(lang, 'project_close_btn')}",
+                        size="sm",
+                        scale=1, min_width=0,
                         elem_classes=["compact-btn"])
                 project_status = gr.HTML(
-                    _status_html(t(lang, "no_project_active")))
+                    _status_html(t(lang, "project_none")))
 
                 # ---------------- Add agent ----------------
+                # FIX CC: collapsed by default to keep the panel compact.
                 with gr.Accordion(
                         f"\u2795 {t(lang, 'add_agent')}",
-                        open=True):
+                        open=False):
                     new_script_file = gr.File(
                         label=t(lang, "select_script"),
                         file_types=[".py"],
@@ -2188,16 +2638,6 @@ def build_ui() -> gr.Blocks:
                             "\U0001f4c2", size="sm",
                             scale=0, min_width=0,
                             elem_classes=["compact-btn"])
-                    with gr.Row(equal_height=True):
-                        new_port = gr.Number(
-                            value=8000, label=t(lang, "port"),
-                            precision=0, scale=2,
-                            elem_classes=["compact-tb"])
-                        new_orch_port = gr.Number(
-                            value=None,
-                            label=t(lang, "orch_port_optional"),
-                            precision=0, scale=3,
-                            elem_classes=["compact-tb"])
                     with gr.Row(equal_height=True):
                         new_orch_template_file = gr.File(
                             label=t(lang, "orch_template_optional"),
@@ -2221,37 +2661,42 @@ def build_ui() -> gr.Blocks:
                     add_status = gr.HTML(_status_html(""))
 
                 # ---------------- Team save/load ----------------
-                gr.HTML(f'<div class="col-head">\U0001f4be '
-                        f'{t(lang, "team")}</div>')
-                with gr.Row(equal_height=True):
+                # FIX EE: "Load" (reload-only) removed. Reload-on-change
+                # is now automatic in _refresh (see _maybe_reload_team);
+                # "Load and start" covers the manual reload+start case.
+                with gr.Row(equal_height=False):
                     team_save_btn = gr.Button(
                         f"\U0001f4be {t(lang, 'save')}",
                         size="sm", variant="primary", scale=1,
-                        elem_classes=["compact-btn"])
-                    team_load_btn = gr.Button(
-                        f"\U0001f4c2 {t(lang, 'load')}",
-                        size="sm", scale=1,
+                        min_width=0,
                         elem_classes=["compact-btn"])
                     team_load_start_btn = gr.Button(
                         f"\u25b6 {t(lang, 'load_and_start')}",
-                        size="sm", variant="primary", scale=2,
+                        size="sm", variant="primary", scale=1,
+                        min_width=0,
                         elem_classes=["compact-btn"])
-                team_hint = gr.HTML(
-                    f'<div class="team-hint">'
-                    f'{t(lang, "load_hint_v2")}</div>')
                 team_status = gr.HTML(_status_html(""))
 
             with gr.Column(scale=5, min_width=520):
-                with gr.Row(equal_height=True):
-                    gr.HTML(f'<div class="col-head">\U0001f4ca '
-                            f'{t(lang, "agents")}</div>')
-                    refresh_btn = gr.Button(
-                        "\U0001f504", size="sm", scale=0, min_width=0,
-                        elem_classes=["compact-btn"],
-                        elem_id="refresh_btn")
-                cards_html = gr.HTML(_render_cards(lang))
-                summary_json = gr.JSON(show_label=False,
-                                       value=_status_dict(lang))
+                with gr.Tabs():
+                    with gr.Tab(t(lang, "tab_agents")):
+                        with gr.Row(equal_height=True):
+                            gr.HTML(f'<div class="col-head">\U0001f4ca '
+                                    f'{t(lang, "agents")}</div>')
+                            refresh_btn = gr.Button(
+                                "\U0001f504", size="sm", scale=0,
+                                min_width=0,
+                                elem_classes=["compact-btn"],
+                                elem_id="refresh_btn")
+                        cards_html = gr.HTML(_render_cards(lang))
+                        summary_json = gr.JSON(
+                            show_label=False,
+                            value=_status_dict(lang))
+                    with gr.Tab(t(lang, "tab_adopted")):
+                        with gr.Row(equal_height=True):
+                            gr.HTML(f'<div class="col-head">\U0001f4e1 '
+                                    f'{t(lang, "adopted_agents")}</div>')
+                        live_html = gr.HTML(_render_live_tab([], lang))
 
             with gr.Column(scale=2, min_width=300):
                 gr.HTML(f'<div class="col-head">\U0001f4c8 '
@@ -2266,85 +2711,164 @@ def build_ui() -> gr.Blocks:
         timer = gr.Timer(2.0)
 
         def _refresh(lang_code):
+            _maybe_reload_team()   # FIX EE: auto-pick up team.json edits
             for a in _manager.list():
                 _manager.poll(a.id)
+            live = _live_scan_any()
             return (
                 _render_cards(lang_code),
                 _status_dict(lang_code),
                 _render_summary_chart(lang_code),
                 _get_action_log(lang_code),
+                _render_live_tab(live, lang_code),
             )
 
+        demo.load(_refresh, [lang_state],
+                  [cards_html, summary_json, summary_chart,
+                   action_log, live_html])
         timer.tick(_refresh, [lang_state],
-                   [cards_html, summary_json, summary_chart, action_log])
+                   [cards_html, summary_json, summary_chart,
+                    action_log, live_html])
         refresh_btn.click(_refresh, [lang_state],
-                          [cards_html, summary_json,
-                           summary_chart, action_log])
+                          [cards_html, summary_json, summary_chart,
+                           action_log, live_html])
 
-        # ---------------- Project handlers ----------------
-        project_browse.click(_pick_directory_dialog, [], [project_path])
+        # ------------------------------------------------------------------
+        # Project actions: one-click open/create/close
+        # ------------------------------------------------------------------
+        def _status_project(lang_code: str) -> str:
+            if _active_project is None:
+                return _status_html(t(lang_code, "project_none"))
+            n = len(_manager.list())
+            rng = _active_project.port_range
+            return _status_html(
+                f"\u2713 {t(lang_code, 'project_summary', name=_active_project.name, n=n, start=rng[0], end=rng[1])}\n"
+                f"{_active_project.root}")
 
-        def _on_project_create(lang_code, root, name):
+        _project_outs = [project_status, cards_html, summary_json,
+                         action_log, live_html]
+
+        def _empty_project_view(lang_code):
+            return (_status_project(lang_code),
+                    _render_cards(lang_code),
+                    _status_dict(lang_code),
+                    _get_action_log(lang_code),
+                    _render_live_tab(_live_scan_any(), lang_code))
+
+        def _open_after_load(lang_code, project):
+            global _active_project
+            _active_project = project
             try:
-                global _active_project
-                if not root:
-                    return _status_html(
-                        f"\u2717 {t(lang_code, 'project_path_required')}")
-                _manager.stop_all()
-                _manager.agents.clear()
-                _active_project = Project.create(root, name or "")
-                _log_action("log_project_created",
-                            path=_active_project.root)
-                return _status_html(
-                    f"\u2713 {t(lang_code, 'project_created')}: "
-                    f"{_active_project.root}")
+                _kill_orphans_in_range(
+                    project.port_range[0], project.port_range[1],
+                    team_name=project.name)
+            except Exception:
+                pass
+            try:
+                load_team(project.team_file, start_flagged=False)
             except Exception as e:
-                return _status_html(f"\u2717 {e}")
+                print(f"[fona] load after open failed: {e}",
+                      file=sys.stderr, flush=True)
+            # FIX GG: honor autostart on explicit project open.
+            try:
+                for a in list(_manager.list()):
+                    if a.autostart and a.status != "online":
+                        _manager.start(a.id)
+            except Exception as e:
+                print(f"[fona] autostart on open failed: {e}",
+                      file=sys.stderr, flush=True)
+            # FIX EE: remember mtime so _maybe_reload_team does not
+            # fire immediately on the next 2s tick.
+            try:
+                _team_mtime_cache[project.team_file] = os.path.getmtime(
+                    project.team_file)
+            except OSError:
+                _team_mtime_cache.pop(project.team_file, None)
+            _log_action("log_project_opened",
+                        path=project.root, n=len(_manager.list()))
+            return _empty_project_view(lang_code)
 
-        project_create_btn.click(
-            _on_project_create, [lang_state, project_path, project_name],
-            [project_status]).then(
-            _refresh, [lang_state],
-            [cards_html, summary_json, summary_chart, action_log])
+        def _do_open_from_folder(lang_code, folder):
+            try:
+                project = Project.from_folder(folder)
+            except FileNotFoundError:
+                # No team.json in folder/subfolders: offer to create
+                return _do_create_in_folder(lang_code, folder)
+            except ValueError:
+                gr.Warning(t(lang_code, "project_multi_found"))
+                return _empty_project_view(lang_code)
+            except Exception as e:
+                gr.Warning(t(lang_code, "project_open_failed", msg=str(e)))
+                return _empty_project_view(lang_code)
+            return _open_after_load(lang_code, project)
 
-        def _on_project_open(lang_code, root):
+        def _do_open_from_dialog(lang_code):
+            folder = _pick_directory_dialog(
+                t(lang_code, "project_dialog_open_title"))
+            if not folder:
+                return _empty_project_view(lang_code)
+            return _do_open_from_folder(lang_code, folder)
+
+        def _do_create_in_folder(lang_code, folder):
             try:
                 global _active_project
-                if not root:
-                    return (_status_html(
-                        f"\u2717 {t(lang_code, 'project_path_required')}"),
-                        _render_cards(lang_code), _status_dict(lang_code),
-                        _get_action_log(lang_code))
-                project = Project.open(root)
-                _manager.stop_all()
-                _manager.agents.clear()
+                if not folder or not os.path.isdir(folder):
+                    gr.Warning(t(lang_code, "project_path_required"))
+                    return _empty_project_view(lang_code)
+                if os.path.isfile(os.path.join(folder, "team.json")):
+                    gr.Warning(t(lang_code, "project_create_exists"))
+                    return _do_open_from_folder(lang_code, folder)
+                project = Project.create(
+                    folder, os.path.basename(folder), DEFAULT_PORT_RANGE)
+                # FIX FF: save_team() requires _active_project; set it
+                # first, then persist. The old code called save_team()
+                # before assigning _active_project — that raised
+                # RuntimeError("no active project") and the project was
+                # never written to disk.
                 _active_project = project
-                _kill_orphan_children()
-                loaded, _ = load_team(project.team_file,
-                                      start_flagged=False)
-                _log_action("log_project_opened",
-                            path=project.root, n=loaded)
-                return (_status_html(
-                            f"\u2713 {t(lang_code, 'project_opened')}: "
-                            f"{project.root} (+{loaded})"),
-                        _render_cards(lang_code),
-                        _status_dict(lang_code),
-                        _get_action_log(lang_code))
+                save_team("")
+                _log_action("log_project_created", path=project.root)
+                return _empty_project_view(lang_code)
             except Exception as e:
-                return (_status_html(f"\u2717 {e}"),
-                        _render_cards(lang_code),
-                        _status_dict(lang_code),
-                        _get_action_log(lang_code))
+                gr.Warning(t(lang_code, "project_create_invalid",
+                             msg=str(e)))
+                return _empty_project_view(lang_code)
+
+        def _do_create_from_dialog(lang_code):
+            folder = _pick_directory_dialog(
+                t(lang_code, "project_dialog_create_title"))
+            if not folder:
+                return _empty_project_view(lang_code)
+            return _do_create_in_folder(lang_code, folder)
+
+        def _do_close(lang_code):
+            global _active_project
+            # FIX AA: release adopted but do not kill them
+            for a in list(_manager.list()):
+                if a.adopted:
+                    _do_not_adopt.add(a.id)
+                    a.adopted = False
+                    a.process = None
+                    a.status = "stopped"
+                    a.started_at = 0.0
+                    a.first_poll_starting_at = 0.0
+            _manager.agents.clear()
+            _active_project = None
+            _team_mtime_cache.clear()
+            _log_action("log_project_closed")
+            return _empty_project_view(lang_code)
 
         project_open_btn.click(
-            _on_project_open, [lang_state, project_path],
-            [project_status, cards_html, summary_json, action_log])
+            _do_open_from_dialog, [lang_state], _project_outs)
+        project_create_btn.click(
+            _do_create_from_dialog, [lang_state], _project_outs)
+        project_close_btn.click(
+            _do_close, [lang_state], _project_outs)
 
-        # ---------------- Add agent handler ----------------
         new_script_browse.click(
             _pick_script_dialog, [], [new_script_manual])
 
-        def _add(lang_code, file_obj, manual_path, port, orch_port,
+        def _add(lang_code, file_obj, manual_path,
                  orch_tpl_file, orch_tpl_manual, name):
             try:
                 if _active_project is None:
@@ -2390,7 +2914,6 @@ def build_ui() -> gr.Blocks:
                     return _status_html(
                         f"\u2717 {t(lang_code, 'no_script')}")
 
-                # Orchestrator template: manual path wins, else file
                 orch_template = None
                 manual_tpl = (orch_tpl_manual or "").strip()
                 if manual_tpl and os.path.isfile(manual_tpl):
@@ -2409,16 +2932,14 @@ def build_ui() -> gr.Blocks:
 
                 entry = _manager.add(
                     script_path, name or "",
-                    int(port) if port else 8000,
-                    int(orch_port) if orch_port else None,
                     orch_template,
                 )
                 entry.source = source_path
                 entry.source_sha256 = source_sha
                 entry.source_mtime = source_mtime
-                _log_action("log_added", name=entry.name, url=entry.url)
+                _log_action("log_added", name=entry.name)
 
-                msg = f"\u2713 {entry.name} \u2192 {entry.url}"
+                msg = f"\u2713 {entry.name}"
                 if notes:
                     msg += "\n  " + "\n  ".join(notes)
                 return _status_html(msg)
@@ -2428,15 +2949,14 @@ def build_ui() -> gr.Blocks:
         add_btn.click(
             _add,
             [lang_state, new_script_file, new_script_manual,
-             new_port, new_orch_port,
              new_orch_template_file, new_orch_template, new_name],
             [add_status],
         ).then(
             _refresh, [lang_state],
-            [cards_html, summary_json, summary_chart, action_log],
+            [cards_html, summary_json, summary_chart,
+             action_log, live_html],
         )
 
-        # ---------------- Team handlers ----------------
         def _do_save(lang_code):
             try:
                 if _active_project is None:
@@ -2444,6 +2964,10 @@ def build_ui() -> gr.Blocks:
                                 f"\u2717 {t(lang_code, 'no_project')}"),
                             _get_action_log(lang_code))
                 path = save_team("")
+                try:
+                    _team_mtime_cache[path] = os.path.getmtime(path)
+                except OSError:
+                    _team_mtime_cache.pop(path, None)
                 _log_action("log_team_saved", path=path)
                 return (_status_html(
                             f"\u2713 {os.path.basename(path)}: "
@@ -2463,37 +2987,38 @@ def build_ui() -> gr.Blocks:
                                 f"\u2717 {t(lang_code, 'no_project')}"),
                             _render_cards(lang_code),
                             _status_dict(lang_code),
-                            _get_action_log(lang_code))
+                            _get_action_log(lang_code),
+                            _render_live_tab(_live_scan_any(), lang_code))
                 path = _active_project.team_file
                 loaded, started = load_team(
-                    path, start_flagged=bool(start_flagged))
+                    path, start_flagged=bool(start_flagged),
+                    force_start=bool(start_flagged))
                 if start_flagged:
                     _log_action("log_team_loaded_started",
                                 path=path, n=loaded, started=started)
                 else:
                     _log_action("log_team_loaded", path=path, n=loaded)
+                live = _live_scan_any()
                 msg = f"\u2713 +{loaded}"
                 if start_flagged:
                     msg += f", started {started}"
                 return (_status_html(msg),
                         _render_cards(lang_code),
                         _status_dict(lang_code),
-                        _get_action_log(lang_code))
+                        _get_action_log(lang_code),
+                        _render_live_tab(live, lang_code))
             except Exception as e:
                 return (_status_html(f"\u2717 {e}"),
                         _render_cards(lang_code),
                         _status_dict(lang_code),
-                        _get_action_log(lang_code))
-
-        team_load_btn.click(
-            lambda lang_code: _do_load(lang_code, False),
-            [lang_state],
-            [team_status, cards_html, summary_json, action_log])
+                        _get_action_log(lang_code),
+                        _render_live_tab(_live_scan_any(), lang_code))
 
         team_load_start_btn.click(
             lambda lang_code: _do_load(lang_code, True),
             [lang_state],
-            [team_status, cards_html, summary_json, action_log])
+            [team_status, cards_html, summary_json,
+             action_log, live_html])
 
         return demo
 
@@ -2506,6 +3031,7 @@ def launch(host: str = "127.0.0.1",
            inbrowser: bool = True,
            share: bool = False,
            **kwargs) -> None:
+    _ensure_startup_project()
     ui = build_ui()
 
     launch_kwargs = dict(
@@ -2575,13 +3101,8 @@ def launch(host: str = "127.0.0.1",
         while True:
             _t.sleep(1)
     except KeyboardInterrupt:
-        print("[fona] dashboard shutting down, stopping child agents…",
+        print("[fona] dashboard shutting down (children left running)",
               file=sys.stderr, flush=True)
-        _manager.stop_all()
-        try:
-            os.remove(_pid_file())
-        except OSError:
-            pass
 
 
 def main(argv: Optional[List[str]] = None) -> None:

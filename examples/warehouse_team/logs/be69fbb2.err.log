@@ -1,0 +1,5 @@
+[fona] build(): 0.00s (standalone)
+INFO:     Started server process [23500]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8024 (Press CTRL+C to quit)

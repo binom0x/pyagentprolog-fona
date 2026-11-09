@@ -1,0 +1,38 @@
+{
+  "version": 4,
+  "name": "test1",
+  "port_range": [
+    8020,
+    8099
+  ],
+  "saved_at": "2026-11-09T22:41:15",
+  "agents": [
+    {
+      "id": "e48fdec6",
+      "name": "WH",
+      "script": "scripts\\warehouse_agent.py",
+      "autostart": true,
+      "source": "C:\\Users\\admin\\AppData\\Local\\Temp\\gradio\\2e6392ba48375379803eb947013026821d1540c572040d780fe042bfa4ef55e6\\warehouse_agent.py",
+      "source_sha256": "5d5ab43f9d716bbce917443c1456b54912bc15c66ace242e5b06b5c3afb9296d",
+      "source_mtime": 1794239359.7092495
+    },
+    {
+      "id": "21b0c058",
+      "name": "ORDERS",
+      "script": "scripts\\orders_agent.py",
+      "autostart": true,
+      "source": "C:\\Users\\admin\\AppData\\Local\\Temp\\gradio\\77b71ac4ff20415c846a34919c783acff77e89fabdcbdf95a0ad253188a5736b\\orders_agent.py",
+      "source_sha256": "f07beb5963e604c872735b560cbeb7776da1a1144244e6a1194a0469fd41f4c5",
+      "source_mtime": 1794239388.885618
+    },
+    {
+      "id": "2c87ef27",
+      "name": "CHAT",
+      "script": "scripts\\chat_agent.py",
+      "autostart": true,
+      "source": "C:\\Users\\admin\\AppData\\Local\\Temp\\gradio\\01917a75072b09cfca5f4b8fc5b3681f58bb19cfd05f640c47019e5b5eb2995c\\chat_agent.py",
+      "source_sha256": "6968bad17c25e3fa11f84c2e7704a3587890f7d68309993827d0eced4303e558",
+      "source_mtime": 1794239409.8847895
+    }
+  ]
+}
