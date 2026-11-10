@@ -1,3 +1,0 @@
-[console_scripts]
-fona-dashboard = fona.dashboard:main
-fona-orchestrator = fona.orchestrator_app:main
